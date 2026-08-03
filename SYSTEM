@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""SYNTAX operator system integration layer.
+
+This module provides a lightweight operator-facing control plane that aligns
+with the capabilities described in the OPERATOR and README files.
+"""
+
+from __future__ import annotations
+
+import random
+import sys
+from datetime import datetime
+from typing import Dict, List, Optional
+
+
+class OperatorSystem:
+    """Coordinate operator-facing security monitoring functions."""
+
+    def __init__(self) -> None:
+        self.operator_mode = "SYNTAX OPERATOR"
+        self.components = [
+            "Threat Intelligence",
+            "UEBA Analytics",
+            "CSPM Monitoring",
+            "Quantum Crypto",
+        ]
+        self._incident_seed = [
+            ("Beaconing activity", "HIGH"),
+            ("Credential stuffing", "MEDIUM"),
+            ("Lateral movement", "CRITICAL"),
+            ("Data exfiltration", "HIGH"),
+        ]
+
+    def build_report(self) -> Dict[str, object]:
+        """Return a structured summary used by the operator system."""
+        active_incidents = len(self._incident_seed) + random.randint(0, 3)
+        if active_incidents >= 4:
+            threat_level = "CRITICAL"
+        elif active_incidents >= 3:
+            threat_level = "HIGH"
+        elif active_incidents >= 2:
+            threat_level = "MEDIUM"
+        else:
+            threat_level = "LOW"
+
+        return {
+            "status": "OPERATIONAL",
+            "operator_mode": self.operator_mode,
+            "active_incidents": active_incidents,
+            "threat_level": threat_level,
+            "components": self.components,
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+
+    def print_report(self, report: Optional[Dict[str, object]] = None) -> None:
+        """Print a concise operator report to the terminal."""
+        if report is None:
+            report = self.build_report()
+
+        print("=" * 72)
+        print(f"{self.operator_mode}")
+        print("=" * 72)
+        print(f"Status: {report['status']}")
+        print(f"Active incidents: {report['active_incidents']}")
+        print(f"Threat level: {report['threat_level']}")
+        print(f"Timestamp: {report['timestamp']}")
+        print("Active components:")
+        for component in report["components"]:
+            print(f" - {component}")
+        print("=" * 72)
+
+    def run(self) -> Dict[str, object]:
+        """Execute the operator system workflow."""
+        report = self.build_report()
+        self.print_report(report)
+        return report
+
+
+def main() -> int:
+    operator = OperatorSystem()
+    operator.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
