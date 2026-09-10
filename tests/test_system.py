@@ -1,11 +1,15 @@
 import importlib.util
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
 def load_system_module():
     module_path = Path(__file__).resolve().parents[1] / "SYSTEM"
-    spec = importlib.util.spec_from_file_location("syntax_system", module_path)
+    # The "SYSTEM" file has no .py extension, so spec_from_file_location cannot
+    # infer a loader and returns None; supply an explicit source-file loader.
+    loader = SourceFileLoader("syntax_system", str(module_path))
+    spec = importlib.util.spec_from_file_location("syntax_system", module_path, loader=loader)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
