@@ -52,10 +52,18 @@ class OperatorSystem:
             "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
+    _REPORT_FIELDS = ("status", "active_incidents", "threat_level", "timestamp", "components")
+
     def print_report(self, report: Optional[Dict[str, object]] = None) -> None:
         """Print a concise operator report to the terminal."""
         if report is None:
             report = self.build_report()
+        elif not isinstance(report, dict):
+            raise TypeError("report must be a dict.")
+        else:
+            missing = [k for k in self._REPORT_FIELDS if k not in report]
+            if missing:
+                raise ValueError(f"report is missing required fields: {', '.join(missing)}")
 
         print("=" * 72)
         print(f"{self.operator_mode}")
