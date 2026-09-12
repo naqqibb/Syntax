@@ -27,6 +27,11 @@ Scores sanctions-evasion cases from typology-weighted indicators, classifies the
 monetary regime of wartime field sites, and gates defensive sinkhole action on
 military-alliance standing. See [Sanctions module](#sanctions-module) below.
 
+### 6. IRS / BSA Filing Cypher Diagnostician
+Decodes the coded fields on IRS- and FinCEN-administered financial reports, runs
+consistency and threshold diagnostics over them, and emits evasion signals into
+the sanctions tracker. See [Filings module](#filings-module) below.
+
 ---
 
 ## Installation
@@ -235,6 +240,73 @@ technical action inside a contested or adversarial state.
 
 ---
 
+## Filings Module
+
+`FILINGS` decodes the coded fields — the "cyphers" — carried by IRS- and
+FinCEN-administered financial reports, runs diagnostics over them, and converts
+surviving findings into evasion signals the [sanctions tracker](#sanctions-module)
+can score.
+
+```bash
+python3 FILINGS             # diagnosis of the bundled synthetic filings
+python3 FILINGS --codes     # print the cypher code tables
+python3 FILINGS --json      # machine-readable diagnosis
+```
+
+> **Code tables are a structural model, not an authoritative transcription.**
+> Thresholds, category codes, and filing deadlines change. Validate
+> `CYPHER_TABLES` and `REPORTING_THRESHOLDS` against the current IRS and FinCEN
+> instructions before operational use. The module reports where a filing looks
+> internally inconsistent; it does not determine that any filing is wrong, and it
+> makes no finding about any person. Bundled filings are synthetic.
+
+### Instruments covered
+
+| Instrument | Coded fields modelled |
+| --- | --- |
+| Form 8300 — cash over $10,000 | `method_of_payment`, `transaction_nature` |
+| FinCEN 114 (FBAR) | `account_type`, `filer_capacity` |
+| FinCEN 112 (CTR) | `transaction_type`, `conductor_role` |
+| FinCEN 111 (SAR) | `activity_category`, `instrument_involved` |
+| Form 8938 (FATCA) | `asset_category` |
+| Form 926 | `transfer_category` |
+
+### Diagnostic checks
+
+| Finding | Severity | Condition |
+| --- | --- | --- |
+| `THRESHOLD_SPLIT` | Critical | Two or more sub-threshold filings by one subject, same instrument, aggregating past the threshold inside a 14-day window |
+| `STRUCTURING_PROXIMITY` | High | A single amount landing in the 85–100% band below a threshold |
+| `MISSING_REQUIRED_CYPHER` | High | A coded field the instrument requires is absent |
+| `LATE_FILING` | High / Medium | Filed past the statutory window; escalates beyond 30 days overdue |
+| `UNKNOWN_CYPHER` | Medium | A code absent from the field's table, or a field with no table |
+| `CYPHER_AMOUNT_MISMATCH` | Medium | A coded instrument that disagrees with the coded activity |
+| `JURISDICTION_CONFLICT` | Medium | Account jurisdiction diverging from the subject of record |
+| `SUBTHRESHOLD_FILING` | Info | Below threshold — filed voluntarily or under another trigger |
+
+The split check reports the **widest** qualifying run rather than the first pair
+it finds, so a three-way split is not understated as a two-way one.
+
+### Bridge into the sanctions tracker
+
+Findings carrying a typology hint become `EvasionSignal` objects with
+`irs-filing:<id>` provenance, at deliberately modest confidence — a filing
+inconsistency is one thread, not a case. SAR instrument codes map directly:
+`CVC` → virtual-asset chain-hopping, `BULL` → bullion flight, `TRADE` → trade
+misinvoicing, `WIRE` → correspondent-bank nesting.
+
+```python
+diagnosis = build_demo_diagnosis()
+for signal in diagnosis.to_sanctions_signals():
+    case.add_signal(signal)
+```
+
+Because `EvasionCase` scoring decays repeated contributions, a stack of filing
+findings alone will not carry a case into an actionable tier without independent
+corroboration from another collection stream.
+
+---
+
 ## Development
 
 ### Project Structure
@@ -248,6 +320,7 @@ Syntax/
 ├── OPERATOR           # Operator documentation
 ├── SYSTEM             # Operator system integration layer
 ├── SANCTIONS          # Sanctions evasion tracker & monetary ethnography
+├── FILINGS            # IRS / BSA filing cypher diagnostician
 └── tests/             # Unit tests (python3 -m unittest discover -s tests)
 ```
 

@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+SYNTAX IRS / BSA Filing Cypher Diagnostician
+
+Decodes the coded fields ("cyphers") carried by IRS- and FinCEN-administered
+financial reports, runs diagnostic checks over them, and converts surviving
+findings into evasion signals consumable by the SANCTIONS module.
+
+Covered instruments:
+    Form 8300   - cash received over $10,000 in a trade or business (IRS)
+    FBAR / 114  - report of foreign bank and financial accounts (FinCEN/IRS)
+    CTR / 112   - currency transaction report (FinCEN)
+    SAR / 111   - suspicious activity report (FinCEN)
+    Form 8938   - statement of specified foreign financial assets (FATCA)
+    Form 926    - return by a transferor of property to a foreign corporation
+
+IMPORTANT - code tables below are structural models carrying representative
+values, not an authoritative transcription. Thresholds, category codes, and
+filing deadlines change; validate CYPHER_TABLES and REPORTING_THRESHOLDS
+against the current IRS and FinCEN instructions before operational use. The
+diagnostician reports where a filing looks inconsistent; it does not determine
+that any filing is wrong, and it makes no finding about any person.
+
+All sample filings shipped with --demo are synthetic.
+
+Copyright 2025 - Apache License 2.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+# ============================================================================
+# TERMINAL UI UTILITIES
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal output"""
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================================
+# FILING TYPES AND CYPHER TABLES
+# ============================================================================
+
+class FilingType(Enum):
+    """IRS / FinCEN reports carrying coded fields."""
+    FORM_8300 = "Form 8300 - cash payments over $10,000"
+    FBAR_114 = "FinCEN Form 114 - foreign bank account report"
+    CTR_112 = "FinCEN Form 112 - currency transaction report"
+    SAR_111 = "FinCEN Form 111 - suspicious activity report"
+    FORM_8938 = "Form 8938 - specified foreign financial assets"
+    FORM_926 = "Form 926 - transfer of property to a foreign corporation"
+
+
+# Coded field vocabularies per filing type. Structural model only - see the
+# module docstring before relying on any specific code.
+CYPHER_TABLES: Dict[FilingType, Dict[str, Dict[str, str]]] = {
+    FilingType.FORM_8300: {
+        "method_of_payment": {
+            "A": "US currency",
+            "B": "Foreign currency",
+            "C": "Cashier's check",
+            "D": "Money order",
+            "E": "Bank draft",
+            "F": "Traveler's check",
+        },
+        "transaction_nature": {
+            "01": "Personal property purchase",
+            "02": "Real property purchase",
+            "03": "Personal services provided",
+            "04": "Business services provided",
+            "05": "Intangible property purchase",
+            "06": "Debt obligations paid",
+            "07": "Exchange of cash",
+            "08": "Escrow or trust funds",
+            "09": "Bail received",
+            "10": "Other",
+        },
+    },
+    FilingType.FBAR_114: {
+        "account_type": {
+            "1": "Bank account",
+            "2": "Securities account",
+            "3": "Other financial account",
+        },
+        "filer_capacity": {
+            "S": "Separate or individual owner",
+            "J": "Joint owner",
+            "G": "Signature authority only",
+        },
+    },
+    FilingType.CTR_112: {
+        "transaction_type": {
+            "A": "Cash in - deposit",
+            "B": "Cash in - payment",
+            "C": "Cash in - currency exchange",
+            "D": "Cash out - withdrawal",
+            "E": "Cash out - negotiable instrument cashed",
+            "F": "Cash out - currency exchange",
+        },
+        "conductor_role": {
+            "01": "Conducted on own behalf",
+            "02": "Conducted on behalf of another",
+            "03": "Courier service",
+        },
+    },
+    FilingType.SAR_111: {
+        "activity_category": {
+            "STRUCT": "Structuring",
+            "ML": "Money laundering",
+            "TF": "Terrorist financing",
+            "FRAUD": "Fraud",
+            "IDENT": "Identification or documentation",
+            "CYBER": "Cyber event",
+            "SEC": "Securities or futures",
+            "CASINO": "Casinos and card clubs",
+            "INS": "Insurance",
+            "OTHER": "Other suspicious activity",
+        },
+        "instrument_involved": {
+            "CUR": "Currency",
+            "WIRE": "Funds transfer",
+            "CVC": "Convertible virtual currency",
+            "NEG": "Negotiable instrument",
+            "TRADE": "Trade finance instrument",
+            "BULL": "Bullion or precious metals",
+        },
+    },
+    FilingType.FORM_8938: {
+        "asset_category": {
+            "DEP": "Deposit account",
+            "CUST": "Custodial account",
+            "OTHER": "Other foreign financial asset",
+        },
+    },
+    FilingType.FORM_926: {
+        "transfer_category": {
+            "CASH": "Cash transfer",
+            "STOCK": "Stock or securities",
+            "IP": "Intangible property",
+            "TANG": "Tangible property",
+        },
+    },
+}
+
+
+# Coded fields a filing of each type is expected to carry.
+REQUIRED_FIELDS: Dict[FilingType, Tuple[str, ...]] = {
+    FilingType.FORM_8300: ("method_of_payment", "transaction_nature"),
+    FilingType.FBAR_114: ("account_type", "filer_capacity"),
+    FilingType.CTR_112: ("transaction_type", "conductor_role"),
+    FilingType.SAR_111: ("activity_category", "instrument_involved"),
+    FilingType.FORM_8938: ("asset_category",),
+    FilingType.FORM_926: ("transfer_category",),
+}
+
+
+@dataclass(frozen=True)
+class ReportingRule:
+    """Reporting threshold and filing window for one instrument."""
+    threshold_usd: Optional[float]
+    filing_window_days: Optional[int]
+    aggregate: bool = False
+
+
+# Structural model - validate against current instructions before use.
+REPORTING_THRESHOLDS: Dict[FilingType, ReportingRule] = {
+    FilingType.FORM_8300: ReportingRule(10_000.0, 15),
+    FilingType.CTR_112: ReportingRule(10_000.0, 15),
+    FilingType.SAR_111: ReportingRule(5_000.0, 30),
+    FilingType.FBAR_114: ReportingRule(10_000.0, None, aggregate=True),
+    FilingType.FORM_8938: ReportingRule(50_000.0, None, aggregate=True),
+    FilingType.FORM_926: ReportingRule(100_000.0, None),
+}
+
+# Amounts landing in this band below a threshold read as deliberate avoidance.
+STRUCTURING_BAND = (0.85, 1.0)
+
+# Window over which several sub-threshold filings are read as one split.
+SPLIT_WINDOW_DAYS = 14
+
+
+# ============================================================================
+# FILINGS
+# ============================================================================
+
+@dataclass
+class Filing:
+    """One submitted report with its coded fields and amounts."""
+    filing_id: str
+    filing_type: FilingType
+    subject: str
+    amount_usd: float
+    transaction_date: str
+    filed_date: str
+    cyphers: Dict[str, str] = field(default_factory=dict)
+    subject_jurisdiction: str = "US"
+    account_jurisdiction: Optional[str] = None
+    counterparty: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.amount_usd < 0:
+            raise ValueError("amount_usd must not be negative")
+        self.subject_jurisdiction = self.subject_jurisdiction.upper()
+        if self.account_jurisdiction:
+            self.account_jurisdiction = self.account_jurisdiction.upper()
+        # Fail fast on malformed dates rather than deep inside a check.
+        self.transaction_day
+        self.filed_day
+
+    @property
+    def transaction_day(self) -> date:
+        return date.fromisoformat(self.transaction_date)
+
+    @property
+    def filed_day(self) -> date:
+        return date.fromisoformat(self.filed_date)
+
+    @property
+    def filing_lag_days(self) -> int:
+        return (self.filed_day - self.transaction_day).days
+
+    def decode(self) -> Dict[str, str]:
+        """Resolve each coded field to its plain-language meaning."""
+        table = CYPHER_TABLES.get(self.filing_type, {})
+        decoded: Dict[str, str] = {}
+        for name, code in self.cyphers.items():
+            decoded[name] = table.get(name, {}).get(code, f"UNKNOWN CODE '{code}'")
+        return decoded
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "filing_id": self.filing_id,
+            "filing_type": self.filing_type.name,
+            "filing_label": self.filing_type.value,
+            "subject": self.subject,
+            "amount_usd": self.amount_usd,
+            "transaction_date": self.transaction_date,
+            "filed_date": self.filed_date,
+            "filing_lag_days": self.filing_lag_days,
+            "subject_jurisdiction": self.subject_jurisdiction,
+            "account_jurisdiction": self.account_jurisdiction,
+            "counterparty": self.counterparty,
+            "cyphers": dict(self.cyphers),
+            "decoded": self.decode(),
+        }
+
+
+# ============================================================================
+# DIAGNOSTIC FINDINGS
+# ============================================================================
+
+class Severity(Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+
+SEVERITY_ORDER: Dict[Severity, int] = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.INFO: 4,
+}
+
+
+class FindingCode(Enum):
+    """Diagnostic conditions the cypher checks can raise."""
+    UNKNOWN_CYPHER = "Coded value not present in the filing's code table"
+    MISSING_REQUIRED_CYPHER = "Required coded field absent from the filing"
+    STRUCTURING_PROXIMITY = "Amount sits just below a reporting threshold"
+    THRESHOLD_SPLIT = "Sub-threshold filings aggregate past the threshold"
+    CYPHER_AMOUNT_MISMATCH = "Coded instrument disagrees with the amount profile"
+    JURISDICTION_CONFLICT = "Account jurisdiction diverges from subject jurisdiction"
+    LATE_FILING = "Filed outside the statutory window"
+    SUBTHRESHOLD_FILING = "Amount falls below the instrument's reporting threshold"
+
+
+@dataclass
+class Finding:
+    """One diagnostic result against one or more filings."""
+    code: FindingCode
+    severity: Severity
+    detail: str
+    filing_ids: List[str]
+    subject: str
+    jurisdiction: str = "US"
+    typology_hint: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "code": self.code.name,
+            "description": self.code.value,
+            "severity": self.severity.value,
+            "detail": self.detail,
+            "filing_ids": list(self.filing_ids),
+            "subject": self.subject,
+            "jurisdiction": self.jurisdiction,
+            "typology_hint": self.typology_hint,
+        }
+
+
+# Findings that map onto a SANCTIONS evasion typology, with the confidence a
+# single filing-level observation is worth on its own.
+TYPOLOGY_BRIDGE: Dict[FindingCode, Tuple[str, float]] = {
+    FindingCode.STRUCTURING_PROXIMITY: ("TRADE_MISINVOICING", 0.45),
+    FindingCode.THRESHOLD_SPLIT: ("SHELL_LAYERING", 0.60),
+    FindingCode.JURISDICTION_CONFLICT: ("CORRESPONDENT_BANK_NESTING", 0.50),
+    FindingCode.CYPHER_AMOUNT_MISMATCH: ("TRADE_MISINVOICING", 0.40),
+}
+
+# SAR instrument codes that point at a specific typology when present.
+SAR_INSTRUMENT_TYPOLOGY: Dict[str, Tuple[str, float]] = {
+    "CVC": ("CRYPTO_MIXER_HOP", 0.55),
+    "BULL": ("GOLD_BULLION_FLIGHT", 0.55),
+    "TRADE": ("TRADE_MISINVOICING", 0.50),
+    "WIRE": ("CORRESPONDENT_BANK_NESTING", 0.45),
+}
+
+
+# ============================================================================
+# DIAGNOSTICIAN
+# ============================================================================
+
+class FilingDiagnostician:
+    """Runs cypher and consistency checks across a set of filings."""
+
+    def diagnose(self, filings: Sequence[Filing]) -> List[Finding]:
+        findings: List[Finding] = []
+        for filing in filings:
+            findings.extend(self._check_cyphers(filing))
+            findings.extend(self._check_thresholds(filing))
+            findings.extend(self._check_timeliness(filing))
+            findings.extend(self._check_jurisdiction(filing))
+        findings.extend(self._check_splits(filings))
+        findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.code.name))
+        return findings
+
+    def _check_cyphers(self, filing: Filing) -> List[Finding]:
+        findings: List[Finding] = []
+        table = CYPHER_TABLES.get(filing.filing_type, {})
+
+        for name in REQUIRED_FIELDS.get(filing.filing_type, ()):
+            if name not in filing.cyphers:
+                findings.append(Finding(
+                    code=FindingCode.MISSING_REQUIRED_CYPHER,
+                    severity=Severity.HIGH,
+                    detail=f"{filing.filing_type.name} is missing '{name}'.",
+                    filing_ids=[filing.filing_id],
+                    subject=filing.subject,
+                    jurisdiction=filing.subject_jurisdiction,
+                ))
+
+        for name, code in filing.cyphers.items():
+            known = table.get(name, {})
+            if not known:
+                findings.append(Finding(
+                    code=FindingCode.UNKNOWN_CYPHER,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        f"Field '{name}' has no code table for "
+                        f"{filing.filing_type.name}."
+                    ),
+                    filing_ids=[filing.filing_id],
+                    subject=filing.subject,
+                    jurisdiction=filing.subject_jurisdiction,
+                ))
+            elif code not in known:
+                findings.append(Finding(
+                    code=FindingCode.UNKNOWN_CYPHER,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        f"Code '{code}' is not valid for '{name}' on "
+                        f"{filing.filing_type.name}."
+                    ),
+                    filing_ids=[filing.filing_id],
+                    subject=filing.subject,
+                    jurisdiction=filing.subject_jurisdiction,
+                ))
+
+        findings.extend(self._check_instrument_consistency(filing))
+        return findings
+
+    def _check_instrument_consistency(self, filing: Filing) -> List[Finding]:
+        """Cross-check a coded instrument against the amount it carries."""
+        findings: List[Finding] = []
+
+        if filing.filing_type is FilingType.FORM_8300:
+            # Form 8300 exists to capture cash; a non-cash-equivalent code on a
+            # large receipt means the instrument and the form disagree.
+            payment = filing.cyphers.get("method_of_payment")
+            if payment and payment not in {"A", "B", "C", "D", "E", "F"}:
+                return findings
+            nature = filing.cyphers.get("transaction_nature")
+            if nature == "07" and payment in {"C", "D", "E"}:
+                findings.append(Finding(
+                    code=FindingCode.CYPHER_AMOUNT_MISMATCH,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        "Exchange-of-cash nature coded against a negotiable "
+                        "instrument rather than currency."
+                    ),
+                    filing_ids=[filing.filing_id],
+                    subject=filing.subject,
+                    jurisdiction=filing.subject_jurisdiction,
+                    typology_hint="TRADE_MISINVOICING",
+                ))
+
+        if filing.filing_type is FilingType.SAR_111:
+            instrument = filing.cyphers.get("instrument_involved")
+            category = filing.cyphers.get("activity_category")
+            if category == "STRUCT" and instrument not in {"CUR", "NEG", None}:
+                findings.append(Finding(
+                    code=FindingCode.CYPHER_AMOUNT_MISMATCH,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        f"Structuring category coded against instrument "
+                        f"'{instrument}', which is not currency or a "
+                        "negotiable instrument."
+                    ),
+                    filing_ids=[filing.filing_id],
+                    subject=filing.subject,
+                    jurisdiction=filing.subject_jurisdiction,
+                    typology_hint="TRADE_MISINVOICING",
+                ))
+
+        return findings
+
+    def _check_thresholds(self, filing: Filing) -> List[Finding]:
+        rule = REPORTING_THRESHOLDS.get(filing.filing_type)
+        if rule is None or rule.threshold_usd is None:
+            return []
+
+        ratio = filing.amount_usd / rule.threshold_usd
+        low, high = STRUCTURING_BAND
+
+        if low <= ratio < high:
+            return [Finding(
+                code=FindingCode.STRUCTURING_PROXIMITY,
+                severity=Severity.HIGH,
+                detail=(
+                    f"${filing.amount_usd:,.0f} is {ratio:.1%} of the "
+                    f"${rule.threshold_usd:,.0f} threshold."
+                ),
+                filing_ids=[filing.filing_id],
+                subject=filing.subject,
+                jurisdiction=filing.subject_jurisdiction,
+                typology_hint="TRADE_MISINVOICING",
+            )]
+
+        if ratio < low:
+            return [Finding(
+                code=FindingCode.SUBTHRESHOLD_FILING,
+                severity=Severity.INFO,
+                detail=(
+                    f"${filing.amount_usd:,.0f} is below the "
+                    f"${rule.threshold_usd:,.0f} threshold; filed voluntarily "
+                    "or under another trigger."
+                ),
+                filing_ids=[filing.filing_id],
+                subject=filing.subject,
+                jurisdiction=filing.subject_jurisdiction,
+            )]
+
+        return []
+
+    def _check_timeliness(self, filing: Filing) -> List[Finding]:
+        rule = REPORTING_THRESHOLDS.get(filing.filing_type)
+        if rule is None or rule.filing_window_days is None:
+            return []
+
+        lag = filing.filing_lag_days
+        if lag > rule.filing_window_days:
+            overdue = lag - rule.filing_window_days
+            severity = Severity.HIGH if overdue > 30 else Severity.MEDIUM
+            return [Finding(
+                code=FindingCode.LATE_FILING,
+                severity=severity,
+                detail=(
+                    f"Filed {lag} days after the transaction, "
+                    f"{overdue} days past the {rule.filing_window_days}-day window."
+                ),
+                filing_ids=[filing.filing_id],
+                subject=filing.subject,
+                jurisdiction=filing.subject_jurisdiction,
+            )]
+        return []
+
+    def _check_jurisdiction(self, filing: Filing) -> List[Finding]:
+        account = filing.account_jurisdiction
+        if not account or account == filing.subject_jurisdiction:
+            return []
+        return [Finding(
+            code=FindingCode.JURISDICTION_CONFLICT,
+            severity=Severity.MEDIUM,
+            detail=(
+                f"Account held in {account} against a subject of record in "
+                f"{filing.subject_jurisdiction}."
+            ),
+            filing_ids=[filing.filing_id],
+            subject=filing.subject,
+            jurisdiction=account,
+            typology_hint="CORRESPONDENT_BANK_NESTING",
+        )]
+
+    def _check_splits(self, filings: Sequence[Filing]) -> List[Finding]:
+        """Sub-threshold filings by one subject that aggregate past it.
+
+        Grouped per subject and filing type, since thresholds are per
+        instrument; a run only counts when every filing in it is individually
+        under the threshold but the run is not.
+        """
+        findings: List[Finding] = []
+        groups: Dict[Tuple[str, FilingType], List[Filing]] = {}
+        for filing in filings:
+            groups.setdefault((filing.subject, filing.filing_type), []).append(filing)
+
+        for (subject, filing_type), group in sorted(
+            groups.items(), key=lambda item: (item[0][0], item[0][1].name)
+        ):
+            rule = REPORTING_THRESHOLDS.get(filing_type)
+            if rule is None or rule.threshold_usd is None or len(group) < 2:
+                continue
+
+            ordered = sorted(group, key=lambda f: f.transaction_day)
+            under = [f for f in ordered if f.amount_usd < rule.threshold_usd]
+            if len(under) < 2:
+                continue
+
+            # Report the widest qualifying run rather than the first one found,
+            # so a three-way split is not reported as a two-way split.
+            best: List[Filing] = []
+            for start in range(len(under)):
+                for end in range(start + 1, len(under)):
+                    span = (
+                        under[end].transaction_day - under[start].transaction_day
+                    ).days
+                    if span > SPLIT_WINDOW_DAYS:
+                        break
+                    window = under[start:end + 1]
+                    total = sum(f.amount_usd for f in window)
+                    if total >= rule.threshold_usd and len(window) > len(best):
+                        best = window
+
+            if best:
+                total = sum(f.amount_usd for f in best)
+                span = (best[-1].transaction_day - best[0].transaction_day).days
+                findings.append(Finding(
+                    code=FindingCode.THRESHOLD_SPLIT,
+                    severity=Severity.CRITICAL,
+                    detail=(
+                        f"{len(best)} sub-threshold {filing_type.name} "
+                        f"filings totalling ${total:,.0f} across {span} days "
+                        f"against a ${rule.threshold_usd:,.0f} threshold."
+                    ),
+                    filing_ids=[f.filing_id for f in best],
+                    subject=subject,
+                    jurisdiction=best[0].subject_jurisdiction,
+                    typology_hint="SHELL_LAYERING",
+                ))
+
+        return findings
+
+
+# ============================================================================
+# DIAGNOSIS REPORT
+# ============================================================================
+
+class FilingDiagnosis:
+    """Holds filings, runs the diagnostician, and reports."""
+
+    def __init__(self) -> None:
+        self.filings: List[Filing] = []
+        self.diagnostician = FilingDiagnostician()
+
+    def add(self, filing: Filing) -> Filing:
+        self.filings.append(filing)
+        return filing
+
+    def findings(self) -> List[Finding]:
+        return self.diagnostician.diagnose(self.filings)
+
+    def severity_counts(self) -> Dict[str, int]:
+        counts = {severity.value: 0 for severity in Severity}
+        for finding in self.findings():
+            counts[finding.severity.value] += 1
+        return counts
+
+    def evasion_signals(self) -> List[Dict[str, object]]:
+        """Findings rendered as SANCTIONS-shaped evasion signals.
+
+        Emitted as plain dictionaries so this module stays importable without
+        SANCTIONS present; `to_sanctions_signals` builds the real objects.
+        """
+        signals: List[Dict[str, object]] = []
+        for finding in self.findings():
+            bridge = TYPOLOGY_BRIDGE.get(finding.code)
+            typology = finding.typology_hint or (bridge[0] if bridge else None)
+            if typology is None:
+                continue
+            confidence = bridge[1] if bridge else 0.40
+            signals.append({
+                "typology": typology,
+                "description": finding.detail,
+                "jurisdiction": finding.jurisdiction,
+                "confidence": confidence,
+                "sources": [f"irs-filing:{fid}" for fid in finding.filing_ids],
+            })
+
+        for filing in self.filings:
+            if filing.filing_type is not FilingType.SAR_111:
+                continue
+            instrument = filing.cyphers.get("instrument_involved")
+            mapped = SAR_INSTRUMENT_TYPOLOGY.get(instrument or "")
+            if not mapped:
+                continue
+            typology, confidence = mapped
+            signals.append({
+                "typology": typology,
+                "description": (
+                    f"SAR coded {instrument} "
+                    f"({filing.decode().get('instrument_involved')}) for "
+                    f"${filing.amount_usd:,.0f}."
+                ),
+                "jurisdiction": filing.account_jurisdiction or filing.subject_jurisdiction,
+                "confidence": confidence,
+                "sources": [f"irs-filing:{filing.filing_id}"],
+            })
+        return signals
+
+    def to_sanctions_signals(self) -> List[object]:
+        """Build real SANCTIONS EvasionSignal objects from the diagnosis.
+
+        Raises if the SANCTIONS module is unavailable or has no matching
+        typology, rather than silently dropping evidence.
+        """
+        sanctions = load_sanctions_module()
+        built = []
+        for payload in self.evasion_signals():
+            typology = getattr(sanctions.EvasionTypology, str(payload["typology"]))
+            built.append(sanctions.EvasionSignal(
+                typology=typology,
+                description=str(payload["description"]),
+                jurisdiction=str(payload["jurisdiction"]),
+                confidence=float(payload["confidence"]),
+                sources=list(payload["sources"]),
+            ))
+        return built
+
+    def build_report(self) -> Dict[str, object]:
+        findings = self.findings()
+        return {
+            "status": "OPERATIONAL",
+            "module": "SYNTAX FILINGS",
+            "generated_at": _utcnow(),
+            "filings_reviewed": len(self.filings),
+            "subjects": sorted({filing.subject for filing in self.filings}),
+            "findings_total": len(findings),
+            "severity_counts": self.severity_counts(),
+            "filings": [filing.to_dict() for filing in self.filings],
+            "findings": [finding.to_dict() for finding in findings],
+            "evasion_signals": self.evasion_signals(),
+        }
+
+    def print_report(self, report: Optional[Dict[str, object]] = None) -> None:
+        if report is None:
+            report = self.build_report()
+
+        severity_colors = {
+            "CRITICAL": Colors.RED,
+            "HIGH": Colors.YELLOW,
+            "MEDIUM": Colors.CYAN,
+            "LOW": Colors.GREEN,
+            "INFO": Colors.WHITE,
+        }
+
+        print("=" * 78)
+        print(f"{Colors.BOLD}{Colors.CYAN}SYNTAX IRS FILING CYPHER DIAGNOSIS{Colors.RESET}")
+        print(f"Generated {report['generated_at']}")
+        print("=" * 78)
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Decoded filings{Colors.RESET}")
+        print("-" * 78)
+        for filing in report["filings"]:
+            print(
+                f"{Colors.BLUE}{filing['filing_id']:<12}{Colors.RESET} "
+                f"{filing['filing_type']:<12} ${filing['amount_usd']:>11,.0f}  "
+                f"{filing['subject']}"
+            )
+            for name, meaning in filing["decoded"].items():
+                code = filing["cyphers"][name]
+                print(f"             {name} = {code} -> {meaning}")
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Diagnostic findings{Colors.RESET}")
+        print("-" * 78)
+        if not report["findings"]:
+            print("No findings raised.")
+        for finding in report["findings"]:
+            color = severity_colors.get(str(finding["severity"]), Colors.WHITE)
+            print(
+                f"{color}[{finding['severity']:>8}]{Colors.RESET} "
+                f"{finding['code']} - {finding['subject']}"
+            )
+            print(f"             {finding['detail']}")
+            print(f"             filings: {', '.join(finding['filing_ids'])}")
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Evasion signals emitted{Colors.RESET}")
+        print("-" * 78)
+        for signal in report["evasion_signals"]:
+            print(
+                f"{Colors.GREEN}[{signal['confidence']:.2f}]{Colors.RESET} "
+                f"{signal['typology']} ({signal['jurisdiction']}) "
+                f"<- {', '.join(signal['sources'])}"
+            )
+
+        counts = report["severity_counts"]
+        print("\n" + "=" * 78)
+        print(
+            f"Filings: {report['filings_reviewed']} | "
+            f"Findings: {report['findings_total']} "
+            f"(critical {counts['CRITICAL']}, high {counts['HIGH']}, "
+            f"medium {counts['MEDIUM']}) | "
+            f"Signals: {len(report['evasion_signals'])}"
+        )
+        print("=" * 78)
+
+
+def load_sanctions_module():
+    """Load the sibling SANCTIONS module, which has no file extension."""
+    if "syntax_sanctions" in sys.modules:
+        return sys.modules["syntax_sanctions"]
+
+    module_path = Path(__file__).resolve().parent / "SANCTIONS"
+    loader = importlib.machinery.SourceFileLoader("syntax_sanctions", str(module_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution so dataclasses can resolve the module.
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+# ============================================================================
+# SYNTHETIC DEMONSTRATION DATA
+# ============================================================================
+
+def build_demo_diagnosis() -> FilingDiagnosis:
+    """Populate a diagnosis with synthetic, illustrative filings."""
+    diagnosis = FilingDiagnosis()
+
+    diagnosis.add(Filing(
+        filing_id="F8300-0041",
+        filing_type=FilingType.FORM_8300,
+        subject="Meridian Optics Trading FZE",
+        amount_usd=9_400.0,
+        transaction_date="2025-03-03",
+        filed_date="2025-03-12",
+        cyphers={"method_of_payment": "A", "transaction_nature": "01"},
+    ))
+    diagnosis.add(Filing(
+        filing_id="F8300-0052",
+        filing_type=FilingType.FORM_8300,
+        subject="Meridian Optics Trading FZE",
+        amount_usd=9_600.0,
+        transaction_date="2025-03-09",
+        filed_date="2025-03-18",
+        cyphers={"method_of_payment": "C", "transaction_nature": "07"},
+    ))
+    diagnosis.add(Filing(
+        filing_id="F8300-0063",
+        filing_type=FilingType.FORM_8300,
+        subject="Meridian Optics Trading FZE",
+        amount_usd=8_900.0,
+        transaction_date="2025-03-14",
+        filed_date="2025-05-02",
+        cyphers={"method_of_payment": "A", "transaction_nature": "10"},
+    ))
+    diagnosis.add(Filing(
+        filing_id="SAR-1188",
+        filing_type=FilingType.SAR_111,
+        subject="Meridian Optics Trading FZE",
+        amount_usd=412_000.0,
+        transaction_date="2025-03-20",
+        filed_date="2025-04-02",
+        cyphers={"activity_category": "STRUCT", "instrument_involved": "CVC"},
+        account_jurisdiction="AE",
+        counterparty="Unattributed brokerage",
+    ))
+    diagnosis.add(Filing(
+        filing_id="FBAR-0907",
+        filing_type=FilingType.FBAR_114,
+        subject="Meridian Optics Trading FZE",
+        amount_usd=1_240_000.0,
+        transaction_date="2025-12-31",
+        filed_date="2026-04-10",
+        cyphers={"account_type": "2", "filer_capacity": "Z"},
+        account_jurisdiction="TR",
+    ))
+    diagnosis.add(Filing(
+        filing_id="CTR-2231",
+        filing_type=FilingType.CTR_112,
+        subject="Bullion courier route",
+        amount_usd=14_500.0,
+        transaction_date="2025-04-01",
+        filed_date="2025-04-08",
+        cyphers={"transaction_type": "D"},
+    ))
+
+    return diagnosis
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="SYNTAX IRS / BSA filing cypher diagnostician",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit the diagnosis as JSON instead of text"
+    )
+    parser.add_argument(
+        "--codes", action="store_true", help="print the cypher code tables and exit"
+    )
+    args = parser.parse_args()
+
+    if args.codes:
+        for filing_type, table in CYPHER_TABLES.items():
+            print(f"\n{filing_type.name} - {filing_type.value}")
+            for field_name, codes in table.items():
+                print(f"  {field_name}:")
+                for code, meaning in codes.items():
+                    print(f"    {code:<6} {meaning}")
+        return 0
+
+    diagnosis = build_demo_diagnosis()
+    report = diagnosis.build_report()
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        diagnosis.print_report(report)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Downstream closed the pipe (e.g. `| head`); exit quietly.
+        sys.stderr.close()
+        sys.exit(0)
