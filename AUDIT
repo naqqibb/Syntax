@@ -1,0 +1,1078 @@
+#!/usr/bin/env python3
+"""
+SYNTAX World Bank Interim Audit System
+
+Fiduciary review of Interim Unaudited Financial Reports (IFRs) submitted by
+borrowers on Bank-financed projects, plus the procurement and counterparty
+checks that sit alongside them.
+
+Covers:
+    IFR submission timeliness against the reporting covenant
+    Designated Account reconciliation (opening + advances - uses = closing)
+    Disbursement category allocation, eligibility, and financing percentage
+    Forecast-to-actual variance against tolerance
+    Statement of Expenditures (SOE) ceiling use
+    Procurement prior-review thresholds and contract splitting
+    Debarred and cross-debarred counterparties
+    Annual audit opinion modifications
+
+Findings roll up into an FM risk rating and, where a fiduciary condition also
+indicates evasion, cross into the SANCTIONS module as evasion signals.
+
+IMPORTANT - thresholds, tolerances, and submission windows below are a
+structural model carrying representative values, not an authoritative
+transcription of any Financing Agreement or Bank procedure. Project-specific
+covenants govern; validate AUDIT_PARAMETERS and every project's own category
+table against the applicable legal agreement before operational use. The system
+reports where a report looks internally inconsistent or covenant-divergent; it
+does not determine that any borrower, supplier, or person has done anything
+wrong. All sample data shipped with --demo is synthetic.
+
+Copyright 2025 - Apache License 2.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar
+
+
+# ============================================================================
+# TERMINAL UI UTILITIES
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal output"""
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================================
+# AUDIT PARAMETERS
+# ============================================================================
+
+@dataclass(frozen=True)
+class AuditParameters:
+    """Covenant-derived tolerances. Project agreements override these."""
+    ifr_submission_days: int = 45
+    da_reconciliation_tolerance_usd: float = 1.0
+    forecast_variance_tolerance: float = 0.20
+    soe_ceiling_ratio: float = 0.20
+    prior_review_threshold_usd: float = 500_000.0
+    split_window_days: int = 90
+    split_band: float = 0.85
+
+
+AUDIT_PARAMETERS = AuditParameters()
+
+
+class OpinionType(Enum):
+    """Auditor's opinion on the annual project financial statements."""
+    UNMODIFIED = "unmodified opinion"
+    QUALIFIED = "qualified opinion"
+    ADVERSE = "adverse opinion"
+    DISCLAIMER = "disclaimer of opinion"
+
+
+class RiskRating(Enum):
+    """Financial management residual risk rating."""
+    LOW = "Low"
+    MODERATE = "Moderate"
+    SUBSTANTIAL = "Substantial"
+    HIGH = "High"
+
+
+class ProcurementMethod(Enum):
+    RFB = "Request for bids"
+    RFP = "Request for proposals"
+    RFQ = "Request for quotations"
+    DIRECT = "Direct selection"
+    CQS = "Consultant qualification selection"
+
+
+# Methods that cannot carry a large contract without prior review.
+LIMITED_COMPETITION_METHODS: Set[ProcurementMethod] = {
+    ProcurementMethod.RFQ,
+    ProcurementMethod.DIRECT,
+}
+
+
+# ============================================================================
+# PROJECT STRUCTURES
+# ============================================================================
+
+@dataclass
+class ExpenditureCategory:
+    """One disbursement category from the Financing Agreement."""
+    code: str
+    name: str
+    allocation_usd: float
+    financing_percentage: float = 100.0
+    eligible: bool = True
+
+    def __post_init__(self) -> None:
+        if self.allocation_usd < 0:
+            raise ValueError("allocation_usd must not be negative")
+        if not 0.0 < self.financing_percentage <= 100.0:
+            raise ValueError("financing_percentage must be within 0-100")
+
+
+@dataclass
+class Contract:
+    """A procurement contract charged to a category."""
+    contract_id: str
+    supplier: str
+    category_code: str
+    amount_usd: float
+    signed_date: str
+    method: ProcurementMethod = ProcurementMethod.RFB
+    prior_reviewed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.amount_usd < 0:
+            raise ValueError("amount_usd must not be negative")
+        self.signed_day
+
+    @property
+    def signed_day(self) -> date:
+        return date.fromisoformat(self.signed_date)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "contract_id": self.contract_id,
+            "supplier": self.supplier,
+            "category_code": self.category_code,
+            "amount_usd": self.amount_usd,
+            "signed_date": self.signed_date,
+            "method": self.method.name,
+            "prior_reviewed": self.prior_reviewed,
+        }
+
+
+@dataclass
+class DesignatedAccount:
+    """Designated Account movement for the reporting period."""
+    opening_balance_usd: float
+    advances_usd: float
+    expenditures_usd: float
+    closing_balance_usd: float
+
+    @property
+    def expected_closing_usd(self) -> float:
+        return self.opening_balance_usd + self.advances_usd - self.expenditures_usd
+
+    @property
+    def reconciliation_gap_usd(self) -> float:
+        return round(self.closing_balance_usd - self.expected_closing_usd, 2)
+
+
+@dataclass
+class InterimFinancialReport:
+    """One quarterly IFR with its category expenditures and forecast."""
+    project_id: str
+    period_start: str
+    period_end: str
+    submitted_date: str
+    designated_account: DesignatedAccount
+    expenditures_by_category: Dict[str, float] = field(default_factory=dict)
+    forecast_by_category: Dict[str, float] = field(default_factory=dict)
+    soe_total_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.period_end_day
+        self.submitted_day
+        if date.fromisoformat(self.period_start) > self.period_end_day:
+            raise ValueError("period_start must not follow period_end")
+
+    @property
+    def period_end_day(self) -> date:
+        return date.fromisoformat(self.period_end)
+
+    @property
+    def submitted_day(self) -> date:
+        return date.fromisoformat(self.submitted_date)
+
+    @property
+    def submission_lag_days(self) -> int:
+        return (self.submitted_day - self.period_end_day).days
+
+    @property
+    def total_expenditure_usd(self) -> float:
+        return round(sum(self.expenditures_by_category.values()), 2)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "project_id": self.project_id,
+            "period": f"{self.period_start} to {self.period_end}",
+            "submitted_date": self.submitted_date,
+            "submission_lag_days": self.submission_lag_days,
+            "total_expenditure_usd": self.total_expenditure_usd,
+            "soe_total_usd": self.soe_total_usd,
+            "expenditures_by_category": dict(self.expenditures_by_category),
+            "forecast_by_category": dict(self.forecast_by_category),
+            "designated_account": {
+                "opening_balance_usd": self.designated_account.opening_balance_usd,
+                "advances_usd": self.designated_account.advances_usd,
+                "expenditures_usd": self.designated_account.expenditures_usd,
+                "closing_balance_usd": self.designated_account.closing_balance_usd,
+                "expected_closing_usd": self.designated_account.expected_closing_usd,
+                "reconciliation_gap_usd": self.designated_account.reconciliation_gap_usd,
+            },
+        }
+
+
+@dataclass
+class Project:
+    """A Bank-financed operation under fiduciary review."""
+    project_id: str
+    name: str
+    country: str
+    categories: Dict[str, ExpenditureCategory] = field(default_factory=dict)
+    contracts: List[Contract] = field(default_factory=list)
+    reports: List[InterimFinancialReport] = field(default_factory=list)
+    audit_opinion: OpinionType = OpinionType.UNMODIFIED
+    cumulative_by_category: Dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.country = self.country.upper()
+
+    def add_category(self, category: ExpenditureCategory) -> "Project":
+        self.categories[category.code] = category
+        return self
+
+    def add_contract(self, contract: Contract) -> "Project":
+        self.contracts.append(contract)
+        return self
+
+    def add_report(self, report: InterimFinancialReport) -> "Project":
+        self.reports.append(report)
+        return self
+
+
+# ============================================================================
+# DEBARMENT REGISTRY
+# ============================================================================
+
+class DebarmentBasis(Enum):
+    """Why a counterparty appears on the register."""
+    FRAUDULENT_PRACTICE = "Fraudulent practice"
+    CORRUPT_PRACTICE = "Corrupt practice"
+    COLLUSIVE_PRACTICE = "Collusive practice"
+    COERCIVE_PRACTICE = "Coercive practice"
+    OBSTRUCTIVE_PRACTICE = "Obstructive practice"
+
+
+@dataclass(frozen=True)
+class DebarmentEntry:
+    """A debarred or cross-debarred counterparty."""
+    name: str
+    basis: DebarmentBasis
+    from_date: str
+    to_date: Optional[str] = None
+    cross_debarred: bool = False
+
+    def active_on(self, when: date) -> bool:
+        if when < date.fromisoformat(self.from_date):
+            return False
+        if self.to_date is None:
+            return True
+        return when <= date.fromisoformat(self.to_date)
+
+
+class DebarmentRegistry:
+    """Name-matched register of debarred counterparties.
+
+    Matching is normalized but deliberately conservative: a hit is a prompt to
+    verify against the published register, never a determination on its own.
+    """
+
+    def __init__(self, entries: Optional[Sequence[DebarmentEntry]] = None) -> None:
+        self.entries: List[DebarmentEntry] = list(entries or [])
+
+    @staticmethod
+    def normalize(name: str) -> str:
+        cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in name)
+        suffixes = {"ltd", "llc", "inc", "plc", "sa", "fze", "gmbh", "bv", "co"}
+        tokens = [tok for tok in cleaned.split() if tok and tok not in suffixes]
+        return " ".join(tokens)
+
+    def add(self, entry: DebarmentEntry) -> "DebarmentRegistry":
+        self.entries.append(entry)
+        return self
+
+    def match(self, supplier: str, when: date) -> Optional[DebarmentEntry]:
+        target = self.normalize(supplier)
+        if not target:
+            return None
+        for entry in self.entries:
+            if self.normalize(entry.name) == target and entry.active_on(when):
+                return entry
+        return None
+
+
+# ============================================================================
+# FINDINGS
+# ============================================================================
+
+class Severity(Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+
+SEVERITY_ORDER: Dict[Severity, int] = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+    Severity.INFO: 4,
+}
+
+
+class FindingCode(Enum):
+    """Fiduciary conditions the interim audit can raise."""
+    DEBARRED_COUNTERPARTY = "Contract awarded to a debarred counterparty"
+    DA_UNRECONCILED = "Designated Account does not reconcile"
+    INELIGIBLE_EXPENDITURE = "Expenditure charged to an ineligible category"
+    UNDISCLOSED_CATEGORY = "Expenditure charged outside the agreed categories"
+    CATEGORY_OVERRUN = "Cumulative expenditure exceeds the category allocation"
+    CONTRACT_SPLITTING = "Contracts split below the prior-review threshold"
+    PRIOR_REVIEW_BYPASS = "Contract above threshold without prior review"
+    FINANCING_PERCENTAGE_BREACH = "Disbursed above the agreed financing percentage"
+    MODIFIED_AUDIT_OPINION = "Annual audit opinion is modified"
+    LATE_IFR_SUBMISSION = "IFR submitted outside the reporting window"
+    SOE_CEILING_EXCEEDED = "Statement of Expenditures use above the ceiling"
+    FORECAST_VARIANCE_BREACH = "Actual diverges from forecast beyond tolerance"
+
+
+@dataclass
+class AuditFinding:
+    """One fiduciary finding against a project."""
+    code: FindingCode
+    severity: Severity
+    detail: str
+    project_id: str
+    references: List[str] = field(default_factory=list)
+    amount_usd: Optional[float] = None
+    typology_hint: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "code": self.code.name,
+            "description": self.code.value,
+            "severity": self.severity.value,
+            "detail": self.detail,
+            "project_id": self.project_id,
+            "references": list(self.references),
+            "amount_usd": self.amount_usd,
+            "typology_hint": self.typology_hint,
+        }
+
+
+# Fiduciary findings that also read as evasion indicators, with the confidence
+# one project-level observation is worth on its own.
+TYPOLOGY_BRIDGE: Dict[FindingCode, Tuple[str, float]] = {
+    FindingCode.DEBARRED_COUNTERPARTY: ("FRONT_PROCUREMENT_NETWORK", 0.65),
+    FindingCode.CONTRACT_SPLITTING: ("SHELL_LAYERING", 0.55),
+    FindingCode.PRIOR_REVIEW_BYPASS: ("FRONT_PROCUREMENT_NETWORK", 0.45),
+    FindingCode.INELIGIBLE_EXPENDITURE: ("TRADE_MISINVOICING", 0.40),
+    FindingCode.UNDISCLOSED_CATEGORY: ("TRADE_MISINVOICING", 0.40),
+}
+
+
+# ============================================================================
+# SPLIT DETECTION
+# ============================================================================
+
+T = TypeVar("T")
+
+
+def widest_qualifying_run(
+    items: Sequence[T],
+    when: Callable[[T], date],
+    amount: Callable[[T], float],
+    threshold: float,
+    window_days: int,
+) -> List[T]:
+    """Largest set of sub-threshold items inside one window that clears it.
+
+    Returns the widest run rather than the first qualifying pair, so a
+    four-way split is not understated as a two-way one. An empty list means
+    no run of two or more items clears the threshold within the window.
+    """
+    under = sorted(
+        (item for item in items if amount(item) < threshold), key=when
+    )
+    best: List[T] = []
+    for start in range(len(under)):
+        for end in range(start + 1, len(under)):
+            if (when(under[end]) - when(under[start])).days > window_days:
+                break
+            window = list(under[start:end + 1])
+            if sum(amount(item) for item in window) >= threshold:
+                if len(window) > len(best):
+                    best = window
+    return best
+
+
+# ============================================================================
+# INTERIM AUDIT SYSTEM
+# ============================================================================
+
+class InterimAuditSystem:
+    """Runs the fiduciary checks over a project's interim reporting."""
+
+    def __init__(
+        self,
+        parameters: AuditParameters = AUDIT_PARAMETERS,
+        registry: Optional[DebarmentRegistry] = None,
+    ) -> None:
+        self.parameters = parameters
+        self.registry = registry or DebarmentRegistry()
+
+    def audit(self, project: Project) -> List[AuditFinding]:
+        findings: List[AuditFinding] = []
+        for report in project.reports:
+            findings.extend(self._check_submission(project, report))
+            findings.extend(self._check_designated_account(project, report))
+            findings.extend(self._check_categories(project, report))
+            findings.extend(self._check_soe(project, report))
+            findings.extend(self._check_forecast(project, report))
+        findings.extend(self._check_cumulative(project))
+        findings.extend(self._check_procurement(project))
+        findings.extend(self._check_opinion(project))
+        findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.code.name))
+        return findings
+
+    def _check_submission(
+        self, project: Project, report: InterimFinancialReport
+    ) -> List[AuditFinding]:
+        lag = report.submission_lag_days
+        window = self.parameters.ifr_submission_days
+        if lag <= window:
+            return []
+        overdue = lag - window
+        return [AuditFinding(
+            code=FindingCode.LATE_IFR_SUBMISSION,
+            severity=Severity.HIGH if overdue > 30 else Severity.MEDIUM,
+            detail=(
+                f"IFR for {report.period_start} to {report.period_end} submitted "
+                f"{lag} days after period end, {overdue} days past the "
+                f"{window}-day covenant."
+            ),
+            project_id=project.project_id,
+            references=[report.period_end],
+        )]
+
+    def _check_designated_account(
+        self, project: Project, report: InterimFinancialReport
+    ) -> List[AuditFinding]:
+        gap = report.designated_account.reconciliation_gap_usd
+        if abs(gap) <= self.parameters.da_reconciliation_tolerance_usd:
+            return []
+        direction = "unsupported" if gap > 0 else "unaccounted"
+        return [AuditFinding(
+            code=FindingCode.DA_UNRECONCILED,
+            severity=Severity.CRITICAL,
+            detail=(
+                f"Designated Account closing balance differs from the expected "
+                f"balance by ${gap:,.2f} ({direction})."
+            ),
+            project_id=project.project_id,
+            references=[report.period_end],
+            amount_usd=abs(gap),
+        )]
+
+    def _check_categories(
+        self, project: Project, report: InterimFinancialReport
+    ) -> List[AuditFinding]:
+        findings: List[AuditFinding] = []
+        for code, spent in sorted(report.expenditures_by_category.items()):
+            category = project.categories.get(code)
+            if category is None:
+                findings.append(AuditFinding(
+                    code=FindingCode.UNDISCLOSED_CATEGORY,
+                    severity=Severity.HIGH,
+                    detail=(
+                        f"${spent:,.0f} charged to category '{code}', which is "
+                        "not in the Financing Agreement."
+                    ),
+                    project_id=project.project_id,
+                    references=[report.period_end, code],
+                    amount_usd=spent,
+                    typology_hint="TRADE_MISINVOICING",
+                ))
+                continue
+
+            if not category.eligible:
+                findings.append(AuditFinding(
+                    code=FindingCode.INELIGIBLE_EXPENDITURE,
+                    severity=Severity.CRITICAL,
+                    detail=(
+                        f"${spent:,.0f} charged to ineligible category "
+                        f"{code} ({category.name}); refund may be required."
+                    ),
+                    project_id=project.project_id,
+                    references=[report.period_end, code],
+                    amount_usd=spent,
+                    typology_hint="TRADE_MISINVOICING",
+                ))
+        return findings
+
+    def _check_cumulative(self, project: Project) -> List[AuditFinding]:
+        """Category allocation and financing-percentage checks.
+
+        Cumulative totals carry prior-period spend, so they are checked once
+        per project rather than once per report.
+        """
+        findings: List[AuditFinding] = []
+        totals: Dict[str, float] = dict(project.cumulative_by_category)
+        for report in project.reports:
+            for code, spent in report.expenditures_by_category.items():
+                totals[code] = totals.get(code, 0.0) + spent
+
+        for code, total in sorted(totals.items()):
+            category = project.categories.get(code)
+            if category is None:
+                continue
+            # Ineligible spend is reported by _check_categories; re-reporting it
+            # here as an allocation overrun would double-count the same dollars.
+
+            if category.eligible and total > category.allocation_usd:
+                overrun = total - category.allocation_usd
+                findings.append(AuditFinding(
+                    code=FindingCode.CATEGORY_OVERRUN,
+                    severity=Severity.HIGH,
+                    detail=(
+                        f"Category {code} ({category.name}) cumulative "
+                        f"${total:,.0f} exceeds the ${category.allocation_usd:,.0f} "
+                        f"allocation by ${overrun:,.0f}."
+                    ),
+                    project_id=project.project_id,
+                    references=[code],
+                    amount_usd=overrun,
+                ))
+
+            ceiling = category.allocation_usd * category.financing_percentage / 100.0
+            if category.financing_percentage < 100.0 and total > ceiling:
+                findings.append(AuditFinding(
+                    code=FindingCode.FINANCING_PERCENTAGE_BREACH,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        f"Category {code} financed at "
+                        f"{category.financing_percentage:.0f}% caps Bank funding at "
+                        f"${ceiling:,.0f}; ${total:,.0f} claimed."
+                    ),
+                    project_id=project.project_id,
+                    references=[code],
+                    amount_usd=total - ceiling,
+                ))
+        return findings
+
+    def _check_soe(
+        self, project: Project, report: InterimFinancialReport
+    ) -> List[AuditFinding]:
+        total = report.total_expenditure_usd
+        if total <= 0 or report.soe_total_usd <= 0:
+            return []
+        ratio = report.soe_total_usd / total
+        if ratio <= self.parameters.soe_ceiling_ratio:
+            return []
+        return [AuditFinding(
+            code=FindingCode.SOE_CEILING_EXCEEDED,
+            severity=Severity.MEDIUM,
+            detail=(
+                f"SOE-supported spend is {ratio:.1%} of period expenditure, above "
+                f"the {self.parameters.soe_ceiling_ratio:.0%} ceiling; full "
+                "documentation required."
+            ),
+            project_id=project.project_id,
+            references=[report.period_end],
+            amount_usd=report.soe_total_usd,
+        )]
+
+    def _check_forecast(
+        self, project: Project, report: InterimFinancialReport
+    ) -> List[AuditFinding]:
+        findings: List[AuditFinding] = []
+        tolerance = self.parameters.forecast_variance_tolerance
+        for code, forecast in sorted(report.forecast_by_category.items()):
+            if forecast <= 0:
+                continue
+            actual = report.expenditures_by_category.get(code, 0.0)
+            variance = (actual - forecast) / forecast
+            if abs(variance) <= tolerance:
+                continue
+            findings.append(AuditFinding(
+                code=FindingCode.FORECAST_VARIANCE_BREACH,
+                severity=Severity.LOW,
+                detail=(
+                    f"Category {code} actual ${actual:,.0f} diverges "
+                    f"{variance:+.1%} from the ${forecast:,.0f} forecast, beyond "
+                    f"the {tolerance:.0%} tolerance."
+                ),
+                project_id=project.project_id,
+                references=[report.period_end, code],
+            ))
+        return findings
+
+    def _check_procurement(self, project: Project) -> List[AuditFinding]:
+        findings: List[AuditFinding] = []
+        threshold = self.parameters.prior_review_threshold_usd
+
+        for contract in sorted(project.contracts, key=lambda c: c.contract_id):
+            entry = self.registry.match(contract.supplier, contract.signed_day)
+            if entry is not None:
+                scope = "cross-debarred" if entry.cross_debarred else "debarred"
+                findings.append(AuditFinding(
+                    code=FindingCode.DEBARRED_COUNTERPARTY,
+                    severity=Severity.CRITICAL,
+                    detail=(
+                        f"Contract {contract.contract_id} (${contract.amount_usd:,.0f}) "
+                        f"awarded to '{contract.supplier}', {scope} for "
+                        f"{entry.basis.value.lower()} as of {contract.signed_date}. "
+                        "Verify against the published register."
+                    ),
+                    project_id=project.project_id,
+                    references=[contract.contract_id],
+                    amount_usd=contract.amount_usd,
+                    typology_hint="FRONT_PROCUREMENT_NETWORK",
+                ))
+
+            if contract.amount_usd >= threshold and not contract.prior_reviewed:
+                findings.append(AuditFinding(
+                    code=FindingCode.PRIOR_REVIEW_BYPASS,
+                    severity=Severity.HIGH,
+                    detail=(
+                        f"Contract {contract.contract_id} at ${contract.amount_usd:,.0f} "
+                        f"is at or above the ${threshold:,.0f} prior-review threshold "
+                        "but carries no prior review."
+                    ),
+                    project_id=project.project_id,
+                    references=[contract.contract_id],
+                    amount_usd=contract.amount_usd,
+                    typology_hint="FRONT_PROCUREMENT_NETWORK",
+                ))
+            elif (
+                contract.method in LIMITED_COMPETITION_METHODS
+                and contract.amount_usd >= threshold * self.parameters.split_band
+                and not contract.prior_reviewed
+            ):
+                findings.append(AuditFinding(
+                    code=FindingCode.PRIOR_REVIEW_BYPASS,
+                    severity=Severity.MEDIUM,
+                    detail=(
+                        f"Contract {contract.contract_id} at ${contract.amount_usd:,.0f} "
+                        f"uses {contract.method.value.lower()} just below the "
+                        f"${threshold:,.0f} threshold without prior review."
+                    ),
+                    project_id=project.project_id,
+                    references=[contract.contract_id],
+                    amount_usd=contract.amount_usd,
+                    typology_hint="FRONT_PROCUREMENT_NETWORK",
+                ))
+
+        findings.extend(self._check_splitting(project))
+        return findings
+
+    def _check_splitting(self, project: Project) -> List[AuditFinding]:
+        """Sub-threshold awards to one supplier in one category that aggregate.
+
+        Grouped by supplier and category, since splitting to stay under prior
+        review only works within a single procurement line.
+        """
+        findings: List[AuditFinding] = []
+        threshold = self.parameters.prior_review_threshold_usd
+        groups: Dict[Tuple[str, str], List[Contract]] = {}
+        for contract in project.contracts:
+            key = (contract.supplier, contract.category_code)
+            groups.setdefault(key, []).append(contract)
+
+        for (supplier, category_code), group in sorted(groups.items()):
+            run = widest_qualifying_run(
+                group,
+                when=lambda c: c.signed_day,
+                amount=lambda c: c.amount_usd,
+                threshold=threshold,
+                window_days=self.parameters.split_window_days,
+            )
+            if not run:
+                continue
+            total = sum(contract.amount_usd for contract in run)
+            span = (run[-1].signed_day - run[0].signed_day).days
+            findings.append(AuditFinding(
+                code=FindingCode.CONTRACT_SPLITTING,
+                severity=Severity.CRITICAL,
+                detail=(
+                    f"{len(run)} sub-threshold awards to '{supplier}' under "
+                    f"category {category_code} totalling ${total:,.0f} across "
+                    f"{span} days against a ${threshold:,.0f} prior-review "
+                    "threshold."
+                ),
+                project_id=project.project_id,
+                references=[contract.contract_id for contract in run],
+                amount_usd=total,
+                typology_hint="SHELL_LAYERING",
+            ))
+        return findings
+
+    def _check_opinion(self, project: Project) -> List[AuditFinding]:
+        if project.audit_opinion is OpinionType.UNMODIFIED:
+            return []
+        severity = (
+            Severity.CRITICAL
+            if project.audit_opinion in {OpinionType.ADVERSE, OpinionType.DISCLAIMER}
+            else Severity.HIGH
+        )
+        return [AuditFinding(
+            code=FindingCode.MODIFIED_AUDIT_OPINION,
+            severity=severity,
+            detail=(
+                f"Annual project financial statements carry a "
+                f"{project.audit_opinion.value}."
+            ),
+            project_id=project.project_id,
+            references=[project.project_id],
+        )]
+
+
+# ============================================================================
+# RISK RATING AND REPORTING
+# ============================================================================
+
+def rate_risk(findings: Sequence[AuditFinding]) -> RiskRating:
+    """Roll findings up into an FM residual risk rating.
+
+    Any single critical finding carries the project to High; severity counts
+    below that escalate on volume, since a scatter of medium findings is itself
+    a control-environment signal.
+    """
+    counts = {severity: 0 for severity in Severity}
+    for finding in findings:
+        counts[finding.severity] += 1
+
+    if counts[Severity.CRITICAL] >= 1:
+        return RiskRating.HIGH
+    if counts[Severity.HIGH] >= 3:
+        return RiskRating.HIGH
+    if counts[Severity.HIGH] >= 1 or counts[Severity.MEDIUM] >= 3:
+        return RiskRating.SUBSTANTIAL
+    if counts[Severity.MEDIUM] >= 1 or counts[Severity.LOW] >= 3:
+        return RiskRating.MODERATE
+    return RiskRating.LOW
+
+
+class AuditPortfolio:
+    """Holds projects, runs the interim audit, and reports."""
+
+    def __init__(self, registry: Optional[DebarmentRegistry] = None) -> None:
+        self.projects: List[Project] = []
+        self.registry = registry or DebarmentRegistry()
+        self.system = InterimAuditSystem(registry=self.registry)
+
+    def add(self, project: Project) -> Project:
+        self.projects.append(project)
+        return project
+
+    def findings_for(self, project: Project) -> List[AuditFinding]:
+        return self.system.audit(project)
+
+    def evasion_signals(self) -> List[Dict[str, object]]:
+        """Fiduciary findings rendered as SANCTIONS-shaped evasion signals.
+
+        Emitted as plain dictionaries so this module stays importable without
+        SANCTIONS present; `to_sanctions_signals` builds the real objects.
+        """
+        signals: List[Dict[str, object]] = []
+        for project in self.projects:
+            for finding in self.findings_for(project):
+                bridge = TYPOLOGY_BRIDGE.get(finding.code)
+                typology = finding.typology_hint or (bridge[0] if bridge else None)
+                if typology is None:
+                    continue
+                confidence = bridge[1] if bridge else 0.40
+                signals.append({
+                    "typology": typology,
+                    "description": finding.detail,
+                    "jurisdiction": project.country,
+                    "confidence": confidence,
+                    "sources": [
+                        f"wb-audit:{project.project_id}:{ref}"
+                        for ref in finding.references
+                    ],
+                })
+        return signals
+
+    def to_sanctions_signals(self) -> List[object]:
+        """Build real SANCTIONS EvasionSignal objects from the audit.
+
+        Raises if the SANCTIONS module is unavailable or has no matching
+        typology, rather than silently dropping evidence.
+        """
+        sanctions = load_sanctions_module()
+        built = []
+        for payload in self.evasion_signals():
+            typology = getattr(sanctions.EvasionTypology, str(payload["typology"]))
+            built.append(sanctions.EvasionSignal(
+                typology=typology,
+                description=str(payload["description"]),
+                jurisdiction=str(payload["jurisdiction"]),
+                confidence=float(payload["confidence"]),
+                sources=list(payload["sources"]),
+            ))
+        return built
+
+    def build_report(self) -> Dict[str, object]:
+        entries = []
+        for project in self.projects:
+            findings = self.findings_for(project)
+            counts = {severity.value: 0 for severity in Severity}
+            for finding in findings:
+                counts[finding.severity.value] += 1
+            entries.append({
+                "project_id": project.project_id,
+                "name": project.name,
+                "country": project.country,
+                "audit_opinion": project.audit_opinion.name,
+                "risk_rating": rate_risk(findings).value,
+                "findings_total": len(findings),
+                "severity_counts": counts,
+                "reports": [report.to_dict() for report in project.reports],
+                "contracts": [contract.to_dict() for contract in project.contracts],
+                "findings": [finding.to_dict() for finding in findings],
+            })
+
+        return {
+            "status": "OPERATIONAL",
+            "module": "SYNTAX AUDIT",
+            "generated_at": _utcnow(),
+            "projects_reviewed": len(entries),
+            "high_risk_projects": sum(
+                1 for entry in entries if entry["risk_rating"] == RiskRating.HIGH.value
+            ),
+            "findings_total": sum(int(entry["findings_total"]) for entry in entries),
+            "projects": entries,
+            "evasion_signals": self.evasion_signals(),
+        }
+
+    def print_report(self, report: Optional[Dict[str, object]] = None) -> None:
+        if report is None:
+            report = self.build_report()
+
+        severity_colors = {
+            "CRITICAL": Colors.RED,
+            "HIGH": Colors.YELLOW,
+            "MEDIUM": Colors.CYAN,
+            "LOW": Colors.GREEN,
+            "INFO": Colors.WHITE,
+        }
+        risk_colors = {
+            "High": Colors.RED,
+            "Substantial": Colors.YELLOW,
+            "Moderate": Colors.CYAN,
+            "Low": Colors.GREEN,
+        }
+
+        print("=" * 78)
+        print(f"{Colors.BOLD}{Colors.CYAN}SYNTAX WORLD BANK INTERIM AUDIT{Colors.RESET}")
+        print(f"Generated {report['generated_at']}")
+        print("=" * 78)
+
+        for entry in report["projects"]:
+            color = risk_colors.get(str(entry["risk_rating"]), Colors.WHITE)
+            print(f"\n{Colors.BOLD}{Colors.MAGENTA}> {entry['project_id']} "
+                  f"{entry['name']} ({entry['country']}){Colors.RESET}")
+            print("-" * 78)
+            print(
+                f"FM risk {color}{entry['risk_rating']}{Colors.RESET} | "
+                f"opinion {entry['audit_opinion']} | "
+                f"findings {entry['findings_total']}"
+            )
+
+            for report_entry in entry["reports"]:
+                da = report_entry["designated_account"]
+                print(
+                    f"  IFR {report_entry['period']} submitted "
+                    f"+{report_entry['submission_lag_days']}d | "
+                    f"spend ${report_entry['total_expenditure_usd']:,.0f} | "
+                    f"DA gap ${da['reconciliation_gap_usd']:,.2f}"
+                )
+
+            for finding in entry["findings"]:
+                fcolor = severity_colors.get(str(finding["severity"]), Colors.WHITE)
+                print(
+                    f"  {fcolor}[{finding['severity']:>8}]{Colors.RESET} "
+                    f"{finding['code']}"
+                )
+                print(f"             {finding['detail']}")
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Evasion signals emitted{Colors.RESET}")
+        print("-" * 78)
+        for signal in report["evasion_signals"]:
+            print(
+                f"{Colors.GREEN}[{signal['confidence']:.2f}]{Colors.RESET} "
+                f"{signal['typology']} ({signal['jurisdiction']}) "
+                f"<- {', '.join(signal['sources'])}"
+            )
+
+        print("\n" + "=" * 78)
+        print(
+            f"Projects: {report['projects_reviewed']} | "
+            f"High risk: {report['high_risk_projects']} | "
+            f"Findings: {report['findings_total']} | "
+            f"Signals: {len(report['evasion_signals'])}"
+        )
+        print("=" * 78)
+
+
+def load_sanctions_module():
+    """Load the sibling SANCTIONS module, which has no file extension."""
+    if "syntax_sanctions" in sys.modules:
+        return sys.modules["syntax_sanctions"]
+
+    module_path = Path(__file__).resolve().parent / "SANCTIONS"
+    loader = importlib.machinery.SourceFileLoader("syntax_sanctions", str(module_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution so dataclasses can resolve the module.
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+# ============================================================================
+# SYNTHETIC DEMONSTRATION DATA
+# ============================================================================
+
+def build_demo_portfolio() -> AuditPortfolio:
+    """Populate a portfolio with synthetic, illustrative project data."""
+    registry = DebarmentRegistry([
+        DebarmentEntry(
+            name="Northbridge Civil Works Ltd",
+            basis=DebarmentBasis.COLLUSIVE_PRACTICE,
+            from_date="2024-06-01",
+            to_date="2027-06-01",
+            cross_debarred=True,
+        ),
+    ])
+    portfolio = AuditPortfolio(registry=registry)
+
+    project = Project(
+        project_id="P178220",
+        name="Rural Connectivity and Resilience",
+        country="AM",
+        audit_opinion=OpinionType.QUALIFIED,
+        cumulative_by_category={"1": 3_100_000.0, "2": 780_000.0},
+    )
+    project.add_category(ExpenditureCategory("1", "Civil works", 4_000_000.0))
+    project.add_category(ExpenditureCategory(
+        "2", "Goods and equipment", 1_500_000.0, financing_percentage=80.0
+    ))
+    project.add_category(ExpenditureCategory("3", "Consultant services", 900_000.0))
+    project.add_category(ExpenditureCategory(
+        "4", "Land acquisition", 0.0, eligible=False
+    ))
+
+    project.add_report(InterimFinancialReport(
+        project_id="P178220",
+        period_start="2025-01-01",
+        period_end="2025-03-31",
+        submitted_date="2025-06-20",
+        designated_account=DesignatedAccount(
+            opening_balance_usd=500_000.0,
+            advances_usd=1_200_000.0,
+            expenditures_usd=1_310_000.0,
+            closing_balance_usd=468_000.0,
+        ),
+        expenditures_by_category={
+            "1": 980_000.0,
+            "2": 210_000.0,
+            "4": 85_000.0,
+            "7": 35_000.0,
+        },
+        forecast_by_category={"1": 900_000.0, "2": 400_000.0, "3": 150_000.0},
+        soe_total_usd=390_000.0,
+    ))
+
+    for index, (amount, signed) in enumerate(
+        [(180_000.0, "2025-01-14"), (195_000.0, "2025-02-11"), (165_000.0, "2025-03-18")],
+        start=1,
+    ):
+        project.add_contract(Contract(
+            contract_id=f"CW-{index:03d}",
+            supplier="Kestrel Infrastructure LLC",
+            category_code="1",
+            amount_usd=amount,
+            signed_date=signed,
+            method=ProcurementMethod.RFQ,
+        ))
+
+    project.add_contract(Contract(
+        contract_id="CW-201",
+        supplier="Northbridge Civil Works Ltd",
+        category_code="1",
+        amount_usd=640_000.0,
+        signed_date="2025-02-03",
+        method=ProcurementMethod.RFB,
+        prior_reviewed=True,
+    ))
+    project.add_contract(Contract(
+        contract_id="GD-310",
+        supplier="Halvard Supply Company",
+        category_code="2",
+        amount_usd=720_000.0,
+        signed_date="2025-03-05",
+        method=ProcurementMethod.DIRECT,
+    ))
+
+    portfolio.add(project)
+    return portfolio
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="SYNTAX World Bank interim audit system",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit the audit as JSON instead of text"
+    )
+    args = parser.parse_args()
+
+    portfolio = build_demo_portfolio()
+    report = portfolio.build_report()
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        portfolio.print_report(report)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Downstream closed the pipe (e.g. `| head`); exit quietly.
+        sys.stderr.close()
+        sys.exit(0)

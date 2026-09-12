@@ -32,6 +32,11 @@ Decodes the coded fields on IRS- and FinCEN-administered financial reports, runs
 consistency and threshold diagnostics over them, and emits evasion signals into
 the sanctions tracker. See [Filings module](#filings-module) below.
 
+### 7. World Bank Interim Audit System
+Fiduciary review of Interim Unaudited Financial Reports on Bank-financed
+projects, with Designated Account reconciliation, procurement threshold checks,
+and debarment screening. See [Audit module](#audit-module) below.
+
 ---
 
 ## Installation
@@ -307,6 +312,72 @@ corroboration from another collection stream.
 
 ---
 
+## Audit Module
+
+`AUDIT` performs the fiduciary review of **Interim Unaudited Financial Reports
+(IFRs)** submitted by borrowers on Bank-financed projects, together with the
+procurement and counterparty checks that sit alongside them. Findings roll into
+a financial-management risk rating and, where a fiduciary condition also reads as
+evasion, cross into the [sanctions tracker](#sanctions-module).
+
+```bash
+python3 AUDIT               # audit of the bundled synthetic project
+python3 AUDIT --json        # machine-readable audit
+```
+
+> **Thresholds and tolerances are a structural model, not an authoritative
+> transcription** of any Financing Agreement or Bank procedure. Project-specific
+> covenants govern — validate `AUDIT_PARAMETERS` and each project's category
+> table against the applicable legal agreement before operational use. The system
+> reports where a report looks internally inconsistent or covenant-divergent; it
+> does not determine that any borrower, supplier, or person has done anything
+> wrong. Bundled project data is synthetic.
+
+### Checks
+
+| Finding | Severity | Condition |
+| --- | --- | --- |
+| `DEBARRED_COUNTERPARTY` | Critical | Award to a counterparty active on the debarment or cross-debarment register at signature date |
+| `CONTRACT_SPLITTING` | Critical | Sub-threshold awards to one supplier under one category aggregating past the prior-review threshold inside 90 days |
+| `DA_UNRECONCILED` | Critical | Opening + advances − uses ≠ closing balance |
+| `INELIGIBLE_EXPENDITURE` | Critical | Spend charged to a category the agreement makes ineligible |
+| `CATEGORY_OVERRUN` | High | Cumulative spend past the category allocation |
+| `UNDISCLOSED_CATEGORY` | High | Spend charged outside the agreed categories |
+| `PRIOR_REVIEW_BYPASS` | High / Medium | At or above threshold with no prior review; Medium where limited competition sits just under it |
+| `MODIFIED_AUDIT_OPINION` | Critical / High | Adverse or disclaimer; qualified |
+| `LATE_IFR_SUBMISSION` | High / Medium | Past the 45-day covenant; escalates beyond 30 days overdue |
+| `FINANCING_PERCENTAGE_BREACH` | Medium | Claimed above the category's agreed financing percentage |
+| `SOE_CEILING_EXCEEDED` | Medium | SOE-supported spend above the ceiling ratio |
+| `FORECAST_VARIANCE_BREACH` | Low | Actual diverging from forecast beyond tolerance |
+
+Cumulative checks carry prior-period spend, so they run once per project rather
+than once per report. Ineligible spend is reported once — re-reporting it as an
+allocation overrun would double-count the same dollars.
+
+### Risk rating
+
+Any single critical finding carries a project to **High**. Below that the rating
+escalates on volume, since a scatter of medium findings is itself a control-
+environment signal: three highs → High, one high or three mediums → Substantial,
+one medium or three lows → Moderate, otherwise Low.
+
+### Debarment matching
+
+`DebarmentRegistry` normalizes punctuation and entity suffixes (`Ltd`, `LLC`,
+`FZE`, `GmbH`, …) before comparing, and checks the award date against the
+debarment period so a contract signed before listing is not flagged. Matching is
+deliberately conservative and exact-after-normalization: **a hit is a prompt to
+verify against the published register, never a determination.**
+
+### Bridge into the sanctions tracker
+
+Debarment → front procurement network (0.65), contract splitting → shell layering
+(0.55), prior-review bypass → front procurement network (0.45), ineligible and
+undisclosed spend → trade misinvoicing (0.40). Signals carry
+`wb-audit:<project>:<ref>` provenance.
+
+---
+
 ## Development
 
 ### Project Structure
@@ -321,6 +392,7 @@ Syntax/
 ├── SYSTEM             # Operator system integration layer
 ├── SANCTIONS          # Sanctions evasion tracker & monetary ethnography
 ├── FILINGS            # IRS / BSA filing cypher diagnostician
+├── AUDIT              # World Bank interim audit system
 └── tests/             # Unit tests (python3 -m unittest discover -s tests)
 ```
 
