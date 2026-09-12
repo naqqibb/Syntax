@@ -22,6 +22,11 @@ Scans cloud infrastructure across AWS, Azure, and GCP to identify misconfigurati
 ### 4. Cryptographic Services
 Implements post-quantum cryptographic algorithms for future-proof security communications.
 
+### 5. Sanctions Evasion Tracker & Wartime Monetary Ethnography
+Scores sanctions-evasion cases from typology-weighted indicators, classifies the
+monetary regime of wartime field sites, and gates defensive sinkhole action on
+military-alliance standing. See [Sanctions module](#sanctions-module) below.
+
 ---
 
 ## Installation
@@ -160,6 +165,76 @@ The platform can be configured through environment variables or configuration fi
 
 ---
 
+## Sanctions Module
+
+`SANCTIONS` is a pure-stdlib analyst control plane for tracking sanctions-evasion
+networks in wartime economies and recording whether defensive sinkhole action
+against their infrastructure is authorized. It records decisions; it performs no
+network actions of its own. All data shipped with the module is synthetic.
+
+```bash
+python3 SANCTIONS           # terminal report
+python3 SANCTIONS --json    # machine-readable report
+```
+
+### 1. Evasion tracking
+
+An `EvasionCase` aggregates `EvasionSignal` observations, each attributed to one
+of ten typologies (dual-use re-export, front procurement networks, dark-fleet AIS
+gaps, correspondent-bank nesting, shell layering, trade misinvoicing, virtual-asset
+chain-hopping, bullion flight, hawala settlement, parallel-FX arbitrage).
+
+Scoring is deliberately corroboration-driven: contributions decay geometrically, so
+one loud indicator cannot carry a case, while breadth of typology and independent
+sourcing push the composite up. Cases tier as `ACUTE` / `ELEVATED` / `EMERGENT` /
+`WATCH` / `NOISE`, and only the top two tiers are actionable.
+
+### 2. Monetary ethnography
+
+A `MonetaryObservation` records a field site with both registers: quantitative
+indicators (parallel-market premium, dollarization, barter share, virtual-asset
+settlement share, remittance dependency, scrip issuance) and the observed practices
+that give them meaning. It yields a `MonetaryRegime` classification, a 0-100 stress
+index, a narrative field note, and typology priors — the evasion routes that regime
+structurally subsidizes.
+
+| Regime | Typology priors |
+| --- | --- |
+| Stable fiat | Correspondent-bank nesting |
+| Soft / hard dollarization | Trade misinvoicing, shell layering, bank nesting |
+| Parallel market dominant | Parallel-FX arbitrage, misinvoicing, hawala |
+| Virtual-asset substitution | Mixer/chain-hop laundering, shell layering |
+| Scrip and coupon | Hawala settlement, bullion flight |
+| Barter reversion | Bullion flight, hawala, dark-fleet transfers |
+
+Priors only corroborate a case when the field site sits in a jurisdiction the case
+actually touches, so an unrelated observation cannot inflate a score.
+
+### 3. Alliance-gated sinkhole authority
+
+`SinkholeAuthority` evaluates a request in a fixed precedence — evidentiary
+sufficiency, then humanitarian exposure, then jurisdiction:
+
+1. Cases below `ELEVATED` are `HELD_INSUFFICIENT_EVIDENCE`.
+2. Civilian payment exposure above 15% without a cleared humanitarian review is
+   `DENIED_HUMANITARIAN`, even in a friendly jurisdiction — remittance and
+   medical-supply rails are a welfare question before an enforcement one.
+3. Hosting jurisdiction is resolved against the requesting alliance (NATO, CSTO,
+   SCO, AUKUS, EU CSDP, GCC, or non-aligned):
+
+| Standing | Outcome |
+| --- | --- |
+| `MEMBER` | `AUTHORIZED`, conditioned on a domestic legal order |
+| `PARTNER` | `AUTHORIZED_WITH_COALITION_CONCURRENCE` |
+| `NEUTRAL` | `REFERRED_TO_LEGAL_PROCESS` (mutual legal assistance) |
+| `CONTESTED` / `ADVERSARIAL` | `DENIED_JURISDICTION`, or referred to legal process when the registrar sits in a member or partner state |
+
+Dual bloc membership resolves to the most restrictive standing, so a jurisdiction
+cannot be laundered into an easier lane. No configuration produces unilateral
+technical action inside a contested or adversarial state.
+
+---
+
 ## Development
 
 ### Project Structure
@@ -170,7 +245,10 @@ Syntax/
 ├── requirements.txt    # Python dependencies
 ├── LICENSE            # Apache 2.0 license
 ├── README.md          # This file
-└── OPERATOR           # Operator documentation
+├── OPERATOR           # Operator documentation
+├── SYSTEM             # Operator system integration layer
+├── SANCTIONS          # Sanctions evasion tracker & monetary ethnography
+└── tests/             # Unit tests (python3 -m unittest discover -s tests)
 ```
 
 ### Dependencies

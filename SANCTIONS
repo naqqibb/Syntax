@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+"""
+SYNTAX Sanctions Evasion Tracker & Wartime Monetary Ethnography
+Pure Python Implementation - analyst control plane
+
+Three coupled subsystems:
+
+  1. Evasion tracking   - typology-weighted scoring of sanctions-evasion
+                          indicators with corroboration and breadth bonuses.
+  2. Monetary ethnography - classification of wartime monetary regimes from
+                          mixed quantitative indicators and observed market
+                          practice, producing analyst field notes and
+                          typology priors.
+  3. Sinkhole authority - alliance-gated authorization for defensive sinkhole
+                          action against procurement/payment infrastructure,
+                          with humanitarian and jurisdictional carve-outs.
+
+This module records *decisions*; it does not execute network actions. All
+sample data shipped with --demo is synthetic and illustrative only.
+
+Copyright 2025 - Apache License 2.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+# ============================================================================
+# TERMINAL UI UTILITIES
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal output"""
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================================
+# EVASION TYPOLOGIES
+# ============================================================================
+
+class EvasionTypology(Enum):
+    """Recognized sanctions-evasion typologies."""
+    DUAL_USE_REEXPORT = "Dual-use re-export via third country"
+    FRONT_PROCUREMENT_NETWORK = "Front-company procurement network"
+    DARK_FLEET_AIS_GAP = "Dark-fleet AIS gap / ship-to-ship transfer"
+    CORRESPONDENT_BANK_NESTING = "Nested correspondent banking relationship"
+    SHELL_LAYERING = "Shell-company ownership layering"
+    TRADE_MISINVOICING = "Trade misinvoicing / value transfer"
+    CRYPTO_MIXER_HOP = "Virtual-asset mixer or chain-hop laundering"
+    GOLD_BULLION_FLIGHT = "Gold and bullion value flight"
+    HAWALA_SETTLEMENT = "Informal value transfer (hawala) settlement"
+    PARALLEL_FX_ARBITRAGE = "Parallel-market FX arbitrage"
+
+
+# Base severity weight per typology, 0-10. Reflects how directly the typology
+# supports restricted acquisition rather than how common it is.
+TYPOLOGY_WEIGHT: Dict[EvasionTypology, float] = {
+    EvasionTypology.DUAL_USE_REEXPORT: 9.5,
+    EvasionTypology.FRONT_PROCUREMENT_NETWORK: 9.0,
+    EvasionTypology.DARK_FLEET_AIS_GAP: 8.5,
+    EvasionTypology.CORRESPONDENT_BANK_NESTING: 8.0,
+    EvasionTypology.SHELL_LAYERING: 7.5,
+    EvasionTypology.TRADE_MISINVOICING: 7.0,
+    EvasionTypology.CRYPTO_MIXER_HOP: 6.5,
+    EvasionTypology.GOLD_BULLION_FLIGHT: 6.0,
+    EvasionTypology.HAWALA_SETTLEMENT: 5.0,
+    EvasionTypology.PARALLEL_FX_ARBITRAGE: 4.0,
+}
+
+
+class CaseTier(Enum):
+    """Composite tiering of an evasion case."""
+    ACUTE = "ACUTE"
+    ELEVATED = "ELEVATED"
+    EMERGENT = "EMERGENT"
+    WATCH = "WATCH"
+    NOISE = "NOISE"
+
+
+TIER_THRESHOLDS: Sequence[Tuple[float, CaseTier]] = (
+    (80.0, CaseTier.ACUTE),
+    (60.0, CaseTier.ELEVATED),
+    (40.0, CaseTier.EMERGENT),
+    (20.0, CaseTier.WATCH),
+)
+
+
+@dataclass
+class EvasionSignal:
+    """A single observed indicator attributed to one typology."""
+    typology: EvasionTypology
+    description: str
+    jurisdiction: str
+    confidence: float = 0.5
+    sources: List[str] = field(default_factory=list)
+    value_usd: Optional[float] = None
+    observed_at: str = field(default_factory=_utcnow)
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be within 0.0-1.0")
+        self.jurisdiction = self.jurisdiction.upper()
+
+    @property
+    def weighted_score(self) -> float:
+        """Typology weight scaled by analyst confidence."""
+        return TYPOLOGY_WEIGHT[self.typology] * self.confidence
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "typology": self.typology.name,
+            "typology_label": self.typology.value,
+            "description": self.description,
+            "jurisdiction": self.jurisdiction,
+            "confidence": self.confidence,
+            "sources": list(self.sources),
+            "value_usd": self.value_usd,
+            "observed_at": self.observed_at,
+        }
+
+
+@dataclass
+class EvasionCase:
+    """A tracked network of related evasion signals."""
+    case_id: str
+    subject: str
+    target_regime: str
+    signals: List[EvasionSignal] = field(default_factory=list)
+    infrastructure: List[str] = field(default_factory=list)
+    opened_at: str = field(default_factory=_utcnow)
+
+    def add_signal(self, signal: EvasionSignal) -> "EvasionCase":
+        self.signals.append(signal)
+        return self
+
+    @property
+    def typology_profile(self) -> Set[EvasionTypology]:
+        return {signal.typology for signal in self.signals}
+
+    @property
+    def corroborating_sources(self) -> Set[str]:
+        return {source for signal in self.signals for source in signal.sources}
+
+    @property
+    def exposure_usd(self) -> float:
+        return sum(signal.value_usd or 0.0 for signal in self.signals)
+
+    @property
+    def jurisdictions(self) -> Set[str]:
+        return {signal.jurisdiction for signal in self.signals}
+
+    def score(self) -> float:
+        """Composite 0-100 score.
+
+        Contributions decay geometrically so a single loud indicator cannot
+        carry a case; breadth of typology and independent corroboration are
+        what push a case into actionable tiers.
+        """
+        if not self.signals:
+            return 0.0
+
+        contributions = sorted(
+            (signal.weighted_score for signal in self.signals), reverse=True
+        )
+        base = sum(value * (0.7 ** index) for index, value in enumerate(contributions))
+
+        breadth = len(self.typology_profile)
+        corroboration = len(self.corroborating_sources)
+        multiplier = 1.0 + 0.08 * (breadth - 1) + 0.04 * max(0, corroboration - 1)
+        multiplier = min(multiplier, 1.75)
+
+        return round(min(100.0, base * multiplier * 3.0), 1)
+
+    def tier(self) -> CaseTier:
+        score = self.score()
+        for threshold, tier in TIER_THRESHOLDS:
+            if score >= threshold:
+                return tier
+        return CaseTier.NOISE
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "case_id": self.case_id,
+            "subject": self.subject,
+            "target_regime": self.target_regime,
+            "opened_at": self.opened_at,
+            "score": self.score(),
+            "tier": self.tier().value,
+            "typologies": sorted(t.name for t in self.typology_profile),
+            "jurisdictions": sorted(self.jurisdictions),
+            "corroborating_sources": sorted(self.corroborating_sources),
+            "exposure_usd": self.exposure_usd,
+            "infrastructure": list(self.infrastructure),
+            "signals": [signal.to_dict() for signal in self.signals],
+        }
+
+
+# ============================================================================
+# MONETARY ETHNOGRAPHY
+# ============================================================================
+
+class MonetaryRegime(Enum):
+    """Observed monetary regime of a wartime economy."""
+    STABLE_FIAT = "Stable domestic fiat"
+    SOFT_DOLLARIZATION = "Soft dollarization"
+    HARD_DOLLARIZATION = "Hard dollarization"
+    PARALLEL_MARKET_DOMINANT = "Parallel market dominant"
+    CRYPTO_SUBSTITUTION = "Virtual-asset substitution"
+    SCRIP_AND_COUPON = "Scrip and coupon issuance"
+    BARTER_REVERSION = "Barter reversion"
+
+
+# Which evasion typologies each regime structurally makes cheaper to run.
+REGIME_TYPOLOGY_PRIORS: Dict[MonetaryRegime, Tuple[EvasionTypology, ...]] = {
+    MonetaryRegime.STABLE_FIAT: (
+        EvasionTypology.CORRESPONDENT_BANK_NESTING,
+    ),
+    MonetaryRegime.SOFT_DOLLARIZATION: (
+        EvasionTypology.TRADE_MISINVOICING,
+        EvasionTypology.CORRESPONDENT_BANK_NESTING,
+    ),
+    MonetaryRegime.HARD_DOLLARIZATION: (
+        EvasionTypology.TRADE_MISINVOICING,
+        EvasionTypology.SHELL_LAYERING,
+        EvasionTypology.CORRESPONDENT_BANK_NESTING,
+    ),
+    MonetaryRegime.PARALLEL_MARKET_DOMINANT: (
+        EvasionTypology.PARALLEL_FX_ARBITRAGE,
+        EvasionTypology.TRADE_MISINVOICING,
+        EvasionTypology.HAWALA_SETTLEMENT,
+    ),
+    MonetaryRegime.CRYPTO_SUBSTITUTION: (
+        EvasionTypology.CRYPTO_MIXER_HOP,
+        EvasionTypology.SHELL_LAYERING,
+    ),
+    MonetaryRegime.SCRIP_AND_COUPON: (
+        EvasionTypology.HAWALA_SETTLEMENT,
+        EvasionTypology.GOLD_BULLION_FLIGHT,
+    ),
+    MonetaryRegime.BARTER_REVERSION: (
+        EvasionTypology.GOLD_BULLION_FLIGHT,
+        EvasionTypology.HAWALA_SETTLEMENT,
+        EvasionTypology.DARK_FLEET_AIS_GAP,
+    ),
+}
+
+
+@dataclass
+class MonetaryObservation:
+    """Mixed-method observation of a wartime monetary field site.
+
+    Quantitative fields are ratios in 0.0-1.0 unless noted; `practices` carries
+    the qualitative register - what people are actually observed doing with
+    money - which is what makes the classification legible to an analyst.
+    """
+    site: str
+    country: str
+    official_rate: float
+    parallel_rate: float
+    dollarization_ratio: float = 0.0
+    barter_share: float = 0.0
+    crypto_settlement_share: float = 0.0
+    remittance_dependency: float = 0.0
+    scrip_in_circulation: bool = False
+    practices: List[str] = field(default_factory=list)
+    observed_at: str = field(default_factory=_utcnow)
+
+    def __post_init__(self) -> None:
+        if self.official_rate <= 0 or self.parallel_rate <= 0:
+            raise ValueError("exchange rates must be positive")
+        for name in (
+            "dollarization_ratio",
+            "barter_share",
+            "crypto_settlement_share",
+            "remittance_dependency",
+        ):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be within 0.0-1.0")
+        self.country = self.country.upper()
+
+    @property
+    def parallel_premium(self) -> float:
+        """Parallel-market premium over the official rate, as a ratio."""
+        return round(self.parallel_rate / self.official_rate - 1.0, 4)
+
+    def classify(self) -> MonetaryRegime:
+        """Assign a monetary regime, most disruptive condition first."""
+        if self.barter_share >= 0.30:
+            return MonetaryRegime.BARTER_REVERSION
+        if self.scrip_in_circulation:
+            return MonetaryRegime.SCRIP_AND_COUPON
+        if self.crypto_settlement_share >= 0.25:
+            return MonetaryRegime.CRYPTO_SUBSTITUTION
+        if self.dollarization_ratio >= 0.70:
+            return MonetaryRegime.HARD_DOLLARIZATION
+        if self.parallel_premium >= 0.50:
+            return MonetaryRegime.PARALLEL_MARKET_DOMINANT
+        if self.dollarization_ratio >= 0.35:
+            return MonetaryRegime.SOFT_DOLLARIZATION
+        return MonetaryRegime.STABLE_FIAT
+
+    def stress_index(self) -> float:
+        """0-100 monetary stress composite for cross-site comparison."""
+        premium_component = min(self.parallel_premium, 2.0) / 2.0
+        raw = (
+            0.30 * premium_component
+            + 0.25 * self.dollarization_ratio
+            + 0.20 * self.barter_share
+            + 0.15 * self.crypto_settlement_share
+            + 0.10 * self.remittance_dependency
+        )
+        if self.scrip_in_circulation:
+            raw = min(1.0, raw + 0.10)
+        return round(raw * 100.0, 1)
+
+    def typology_priors(self) -> List[EvasionTypology]:
+        """Typologies the observed regime structurally subsidizes."""
+        return list(REGIME_TYPOLOGY_PRIORS[self.classify()])
+
+    def field_note(self) -> str:
+        """Analyst-facing narrative tying indicators back to practice."""
+        regime = self.classify()
+        premium_pct = self.parallel_premium * 100.0
+        lines = [
+            f"{self.site} ({self.country}) reads as {regime.value.lower()}: "
+            f"the parallel rate sits {premium_pct:.1f}% above the official quote, "
+            f"with {self.dollarization_ratio * 100:.0f}% of settlement in hard currency "
+            f"and {self.barter_share * 100:.0f}% in kind."
+        ]
+        if self.scrip_in_circulation:
+            lines.append(
+                "Locally issued scrip and coupons circulate alongside notes, which "
+                "means the unit of account has detached from the means of payment."
+            )
+        if self.crypto_settlement_share >= 0.10:
+            lines.append(
+                f"Roughly {self.crypto_settlement_share * 100:.0f}% of cross-border "
+                "settlement moves through virtual assets, mostly stablecoins held "
+                "by brokers rather than end users."
+            )
+        if self.remittance_dependency >= 0.30:
+            lines.append(
+                f"Household income is {self.remittance_dependency * 100:.0f}% "
+                "remittance-dependent; any action on payment rails is a civilian "
+                "welfare question before it is an enforcement question."
+            )
+        for practice in self.practices:
+            lines.append(f"Observed: {practice.rstrip('.')}.")
+        priors = self.typology_priors()
+        if priors:
+            lines.append(
+                "Regime priors favour: "
+                + ", ".join(prior.value for prior in priors)
+                + "."
+            )
+        return " ".join(lines)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "site": self.site,
+            "country": self.country,
+            "observed_at": self.observed_at,
+            "official_rate": self.official_rate,
+            "parallel_rate": self.parallel_rate,
+            "parallel_premium": self.parallel_premium,
+            "dollarization_ratio": self.dollarization_ratio,
+            "barter_share": self.barter_share,
+            "crypto_settlement_share": self.crypto_settlement_share,
+            "remittance_dependency": self.remittance_dependency,
+            "scrip_in_circulation": self.scrip_in_circulation,
+            "regime": self.classify().name,
+            "regime_label": self.classify().value,
+            "stress_index": self.stress_index(),
+            "typology_priors": [prior.name for prior in self.typology_priors()],
+            "practices": list(self.practices),
+            "field_note": self.field_note(),
+        }
+
+
+# ============================================================================
+# MILITARY ALLIANCE REGISTRY
+# ============================================================================
+
+class Alliance(Enum):
+    NATO = "North Atlantic Treaty Organization"
+    CSTO = "Collective Security Treaty Organization"
+    SCO = "Shanghai Cooperation Organisation"
+    AUKUS = "Australia-United Kingdom-United States pact"
+    EU_CSDP = "EU Common Security and Defence Policy"
+    GCC = "Gulf Cooperation Council"
+    NON_ALIGNED = "No registered alliance membership"
+
+
+ALLIANCE_MEMBERS: Dict[Alliance, Set[str]] = {
+    Alliance.NATO: {
+        "AL", "BE", "BG", "CA", "HR", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+        "HU", "IS", "IT", "LV", "LT", "LU", "ME", "NL", "MK", "NO", "PL", "PT",
+        "RO", "SK", "SI", "ES", "SE", "TR", "GB", "US",
+    },
+    Alliance.CSTO: {"AM", "BY", "KZ", "KG", "RU", "TJ"},
+    Alliance.SCO: {"BY", "CN", "IN", "IR", "KZ", "KG", "PK", "RU", "TJ", "UZ"},
+    Alliance.AUKUS: {"AU", "GB", "US"},
+    Alliance.EU_CSDP: {
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+        "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+        "SI", "ES", "SE",
+    },
+    Alliance.GCC: {"BH", "KW", "OM", "QA", "SA", "AE"},
+    Alliance.NON_ALIGNED: set(),
+}
+
+
+class Relation(Enum):
+    """Standing between a requesting alliance and a hosting jurisdiction."""
+    MEMBER = "MEMBER"
+    PARTNER = "PARTNER"
+    NEUTRAL = "NEUTRAL"
+    CONTESTED = "CONTESTED"
+    ADVERSARIAL = "ADVERSARIAL"
+
+
+RELATION_SEVERITY: Dict[Relation, int] = {
+    Relation.MEMBER: 0,
+    Relation.PARTNER: 1,
+    Relation.NEUTRAL: 2,
+    Relation.CONTESTED: 3,
+    Relation.ADVERSARIAL: 4,
+}
+
+
+# Bloc-to-bloc standing. Absent pairs default to NEUTRAL.
+ALLIANCE_RELATIONS: Dict[Alliance, Dict[Alliance, Relation]] = {
+    Alliance.NATO: {
+        Alliance.EU_CSDP: Relation.PARTNER,
+        Alliance.AUKUS: Relation.PARTNER,
+        Alliance.GCC: Relation.PARTNER,
+        Alliance.SCO: Relation.CONTESTED,
+        Alliance.CSTO: Relation.ADVERSARIAL,
+    },
+    Alliance.EU_CSDP: {
+        Alliance.NATO: Relation.PARTNER,
+        Alliance.AUKUS: Relation.PARTNER,
+        Alliance.GCC: Relation.PARTNER,
+        Alliance.SCO: Relation.CONTESTED,
+        Alliance.CSTO: Relation.ADVERSARIAL,
+    },
+    Alliance.AUKUS: {
+        Alliance.NATO: Relation.PARTNER,
+        Alliance.EU_CSDP: Relation.PARTNER,
+        Alliance.GCC: Relation.NEUTRAL,
+        Alliance.SCO: Relation.CONTESTED,
+        Alliance.CSTO: Relation.ADVERSARIAL,
+    },
+    Alliance.CSTO: {
+        Alliance.SCO: Relation.PARTNER,
+        Alliance.GCC: Relation.CONTESTED,
+        Alliance.NATO: Relation.ADVERSARIAL,
+        Alliance.EU_CSDP: Relation.ADVERSARIAL,
+        Alliance.AUKUS: Relation.ADVERSARIAL,
+    },
+    Alliance.SCO: {
+        Alliance.CSTO: Relation.PARTNER,
+        Alliance.NATO: Relation.CONTESTED,
+        Alliance.EU_CSDP: Relation.CONTESTED,
+        Alliance.AUKUS: Relation.CONTESTED,
+        Alliance.GCC: Relation.NEUTRAL,
+    },
+    Alliance.GCC: {
+        Alliance.NATO: Relation.PARTNER,
+        Alliance.EU_CSDP: Relation.PARTNER,
+        Alliance.AUKUS: Relation.NEUTRAL,
+        Alliance.CSTO: Relation.CONTESTED,
+        Alliance.SCO: Relation.NEUTRAL,
+    },
+}
+
+
+class AllianceRegistry:
+    """Resolve country codes to blocs and score jurisdictional standing."""
+
+    @staticmethod
+    def alliances_of(country: str) -> List[Alliance]:
+        code = country.upper()
+        found = [
+            alliance
+            for alliance, members in ALLIANCE_MEMBERS.items()
+            if code in members
+        ]
+        return found or [Alliance.NON_ALIGNED]
+
+    @staticmethod
+    def relation(requester: Alliance, country: str) -> Relation:
+        """Standing of `country` as seen from `requester`.
+
+        A country inside the requesting bloc is a MEMBER. Otherwise the most
+        restrictive standing across every bloc it belongs to governs, so dual
+        membership never launders a jurisdiction into an easier lane.
+        """
+        code = country.upper()
+        if code in ALLIANCE_MEMBERS.get(requester, set()):
+            return Relation.MEMBER
+
+        host_blocs = AllianceRegistry.alliances_of(code)
+        if host_blocs == [Alliance.NON_ALIGNED]:
+            return Relation.NEUTRAL
+
+        relations = [
+            ALLIANCE_RELATIONS.get(requester, {}).get(bloc, Relation.NEUTRAL)
+            for bloc in host_blocs
+        ]
+        return max(relations, key=lambda rel: RELATION_SEVERITY[rel])
+
+
+# ============================================================================
+# SINKHOLE AUTHORITY
+# ============================================================================
+
+class SinkholeOutcome(Enum):
+    AUTHORIZED = "AUTHORIZED"
+    AUTHORIZED_WITH_COALITION_CONCURRENCE = "AUTHORIZED_WITH_COALITION_CONCURRENCE"
+    REFERRED_TO_LEGAL_PROCESS = "REFERRED_TO_LEGAL_PROCESS"
+    DENIED_JURISDICTION = "DENIED_JURISDICTION"
+    DENIED_HUMANITARIAN = "DENIED_HUMANITARIAN"
+    HELD_INSUFFICIENT_EVIDENCE = "HELD_INSUFFICIENT_EVIDENCE"
+
+
+ACTIONABLE_TIERS: Set[CaseTier] = {CaseTier.ACUTE, CaseTier.ELEVATED}
+
+
+@dataclass
+class SinkholeRequest:
+    """A proposed sinkhole action against one piece of infrastructure."""
+    indicator: str
+    hosting_jurisdiction: str
+    registrar_jurisdiction: str
+    requesting_alliance: Alliance
+    civilian_payment_share: float = 0.0
+    humanitarian_review_cleared: bool = False
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.civilian_payment_share <= 1.0:
+            raise ValueError("civilian_payment_share must be within 0.0-1.0")
+        self.hosting_jurisdiction = self.hosting_jurisdiction.upper()
+        self.registrar_jurisdiction = self.registrar_jurisdiction.upper()
+
+
+@dataclass
+class SinkholeDecision:
+    """Recorded disposition of a sinkhole request."""
+    request: SinkholeRequest
+    case_id: str
+    outcome: SinkholeOutcome
+    relation: Relation
+    rationale: List[str] = field(default_factory=list)
+    conditions: List[str] = field(default_factory=list)
+    decided_at: str = field(default_factory=_utcnow)
+
+    @property
+    def approved(self) -> bool:
+        return self.outcome in {
+            SinkholeOutcome.AUTHORIZED,
+            SinkholeOutcome.AUTHORIZED_WITH_COALITION_CONCURRENCE,
+        }
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "case_id": self.case_id,
+            "indicator": self.request.indicator,
+            "hosting_jurisdiction": self.request.hosting_jurisdiction,
+            "registrar_jurisdiction": self.request.registrar_jurisdiction,
+            "requesting_alliance": self.request.requesting_alliance.name,
+            "relation": self.relation.value,
+            "outcome": self.outcome.value,
+            "approved": self.approved,
+            "rationale": list(self.rationale),
+            "conditions": list(self.conditions),
+            "decided_at": self.decided_at,
+        }
+
+
+# Civilian payment exposure above this share blocks action pending review.
+HUMANITARIAN_EXPOSURE_THRESHOLD = 0.15
+
+
+class SinkholeAuthority:
+    """Alliance-gated authorization for defensive sinkhole action.
+
+    Precedence is deliberate: evidentiary sufficiency, then humanitarian
+    exposure, then jurisdiction. A technically easy takedown in a member state
+    is still refused when civilians are settling on the same rails.
+    """
+
+    def evaluate(self, case: EvasionCase, request: SinkholeRequest) -> SinkholeDecision:
+        relation = AllianceRegistry.relation(
+            request.requesting_alliance, request.hosting_jurisdiction
+        )
+        rationale: List[str] = []
+        conditions: List[str] = []
+
+        tier = case.tier()
+        rationale.append(f"Case {case.case_id} scored {case.score()} ({tier.value}).")
+
+        if tier not in ACTIONABLE_TIERS:
+            rationale.append(
+                "Score is below the ELEVATED action threshold; collection continues."
+            )
+            return SinkholeDecision(
+                request, case.case_id, SinkholeOutcome.HELD_INSUFFICIENT_EVIDENCE,
+                relation, rationale, conditions,
+            )
+
+        if (
+            request.civilian_payment_share > HUMANITARIAN_EXPOSURE_THRESHOLD
+            and not request.humanitarian_review_cleared
+        ):
+            rationale.append(
+                f"Civilian payment exposure {request.civilian_payment_share:.0%} exceeds "
+                f"the {HUMANITARIAN_EXPOSURE_THRESHOLD:.0%} threshold without a cleared "
+                "humanitarian review."
+            )
+            conditions.append(
+                "Route to humanitarian carve-out review; re-file with a narrowed "
+                "indicator set that excludes remittance and medical-supply flows."
+            )
+            return SinkholeDecision(
+                request, case.case_id, SinkholeOutcome.DENIED_HUMANITARIAN,
+                relation, rationale, conditions,
+            )
+
+        rationale.append(
+            f"Hosting jurisdiction {request.hosting_jurisdiction} stands as "
+            f"{relation.value} to {request.requesting_alliance.name}."
+        )
+
+        if relation is Relation.MEMBER:
+            conditions.extend([
+                "Obtain the domestic legal order required by the hosting state.",
+                "Log sinkhole collection scope and retention before cutover.",
+            ])
+            return SinkholeDecision(
+                request, case.case_id, SinkholeOutcome.AUTHORIZED,
+                relation, rationale, conditions,
+            )
+
+        if relation is Relation.PARTNER:
+            conditions.extend([
+                "Secure written concurrence from the hosting partner's authority.",
+                "Share the evidentiary package before cutover, not after.",
+            ])
+            return SinkholeDecision(
+                request, case.case_id,
+                SinkholeOutcome.AUTHORIZED_WITH_COALITION_CONCURRENCE,
+                relation, rationale, conditions,
+            )
+
+        if relation is Relation.NEUTRAL:
+            conditions.append(
+                "File mutual legal assistance request with the hosting state."
+            )
+            return SinkholeDecision(
+                request, case.case_id, SinkholeOutcome.REFERRED_TO_LEGAL_PROCESS,
+                relation, rationale, conditions,
+            )
+
+        # CONTESTED or ADVERSARIAL hosting: no unilateral technical action.
+        registrar_relation = AllianceRegistry.relation(
+            request.requesting_alliance, request.registrar_jurisdiction
+        )
+        rationale.append(
+            "Unilateral action in a contested or adversarial jurisdiction is out of "
+            "scope for this authority."
+        )
+        if registrar_relation in {Relation.MEMBER, Relation.PARTNER}:
+            rationale.append(
+                f"Registrar jurisdiction {request.registrar_jurisdiction} stands as "
+                f"{registrar_relation.value}, so a registry-level path exists."
+            )
+            conditions.append(
+                "Pursue registrar suspension or DNS-level abuse process instead of "
+                "in-country sinkholing."
+            )
+            return SinkholeDecision(
+                request, case.case_id, SinkholeOutcome.REFERRED_TO_LEGAL_PROCESS,
+                relation, rationale, conditions,
+            )
+
+        conditions.append(
+            "Escalate to the policy and designation track; recommend listing rather "
+            "than technical action."
+        )
+        return SinkholeDecision(
+            request, case.case_id, SinkholeOutcome.DENIED_JURISDICTION,
+            relation, rationale, conditions,
+        )
+
+
+# ============================================================================
+# TRACKER CONTROL PLANE
+# ============================================================================
+
+class SanctionsEvasionTracker:
+    """Holds cases, field observations, and sinkhole dispositions."""
+
+    def __init__(self) -> None:
+        self.cases: Dict[str, EvasionCase] = {}
+        self.observations: List[MonetaryObservation] = []
+        self.decisions: List[SinkholeDecision] = []
+        self.authority = SinkholeAuthority()
+
+    def track(self, case: EvasionCase) -> EvasionCase:
+        self.cases[case.case_id] = case
+        return case
+
+    def observe(self, observation: MonetaryObservation) -> MonetaryObservation:
+        self.observations.append(observation)
+        return observation
+
+    def request_sinkhole(self, case_id: str, request: SinkholeRequest) -> SinkholeDecision:
+        if case_id not in self.cases:
+            raise KeyError(f"unknown case: {case_id}")
+        decision = self.authority.evaluate(self.cases[case_id], request)
+        self.decisions.append(decision)
+        return decision
+
+    def prioritized_cases(self) -> List[EvasionCase]:
+        return sorted(self.cases.values(), key=lambda case: case.score(), reverse=True)
+
+    def corroborated_by_ethnography(self, case: EvasionCase) -> List[EvasionTypology]:
+        """Typologies in the case that field observations predicted.
+
+        Only observations from jurisdictions the case actually touches count,
+        so a regime prior from an unrelated field site cannot inflate a case.
+        """
+        priors: Set[EvasionTypology] = set()
+        for observation in self.observations:
+            if observation.country in case.jurisdictions:
+                priors.update(observation.typology_priors())
+        return sorted(priors & case.typology_profile, key=lambda t: t.name)
+
+    def build_report(self) -> Dict[str, object]:
+        cases = self.prioritized_cases()
+        return {
+            "status": "OPERATIONAL",
+            "module": "SYNTAX SANCTIONS",
+            "generated_at": _utcnow(),
+            "tracked_cases": len(cases),
+            "actionable_cases": sum(
+                1 for case in cases if case.tier() in ACTIONABLE_TIERS
+            ),
+            "total_exposure_usd": round(sum(case.exposure_usd for case in cases), 2),
+            "field_sites": len(self.observations),
+            "sinkhole_decisions": len(self.decisions),
+            "sinkhole_approved": sum(1 for d in self.decisions if d.approved),
+            "cases": [case.to_dict() for case in cases],
+            "observations": [obs.to_dict() for obs in self.observations],
+            "decisions": [decision.to_dict() for decision in self.decisions],
+        }
+
+    def print_report(self, report: Optional[Dict[str, object]] = None) -> None:
+        if report is None:
+            report = self.build_report()
+
+        tier_colors = {
+            "ACUTE": Colors.RED,
+            "ELEVATED": Colors.YELLOW,
+            "EMERGENT": Colors.CYAN,
+            "WATCH": Colors.GREEN,
+            "NOISE": Colors.WHITE,
+        }
+
+        print("=" * 78)
+        print(f"{Colors.BOLD}{Colors.CYAN}SYNTAX SANCTIONS EVASION TRACKER{Colors.RESET}")
+        print(f"Generated {report['generated_at']}")
+        print("=" * 78)
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Evasion cases{Colors.RESET}")
+        print("-" * 78)
+        for case in report["cases"]:
+            color = tier_colors.get(str(case["tier"]), Colors.WHITE)
+            print(
+                f"{color}[{case['tier']:>8}]{Colors.RESET} {case['case_id']} "
+                f"score={case['score']:<5} {case['subject']}"
+            )
+            print(
+                f"           regime={case['target_regime']} "
+                f"typologies={len(case['typologies'])} "
+                f"exposure=${case['exposure_usd']:,.0f}"
+            )
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Monetary field sites{Colors.RESET}")
+        print("-" * 78)
+        for observation in report["observations"]:
+            print(
+                f"{Colors.BLUE}[{observation['stress_index']:>5}]{Colors.RESET} "
+                f"{observation['site']} ({observation['country']}) - "
+                f"{observation['regime_label']}"
+            )
+            print(f"           {observation['field_note']}")
+
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}> Sinkhole dispositions{Colors.RESET}")
+        print("-" * 78)
+        for decision in report["decisions"]:
+            color = Colors.GREEN if decision["approved"] else Colors.RED
+            print(
+                f"{color}[{decision['outcome']}]{Colors.RESET} "
+                f"{decision['indicator']} host={decision['hosting_jurisdiction']} "
+                f"({decision['relation']}) requester={decision['requesting_alliance']}"
+            )
+            for line in decision["rationale"]:
+                print(f"           - {line}")
+            for condition in decision["conditions"]:
+                print(f"           * {condition}")
+
+        print("\n" + "=" * 78)
+        print(
+            f"Cases: {report['tracked_cases']} | "
+            f"Actionable: {report['actionable_cases']} | "
+            f"Sites: {report['field_sites']} | "
+            f"Sinkholes approved: {report['sinkhole_approved']}/"
+            f"{report['sinkhole_decisions']}"
+        )
+        print("=" * 78)
+
+
+# ============================================================================
+# SYNTHETIC DEMONSTRATION DATA
+# ============================================================================
+
+def build_demo_tracker() -> SanctionsEvasionTracker:
+    """Populate a tracker with synthetic, illustrative data."""
+    tracker = SanctionsEvasionTracker()
+
+    case = EvasionCase(
+        case_id="SE-2025-0114",
+        subject="Meridian Optics Trading FZE",
+        target_regime="EMBARGOED-A",
+        infrastructure=["portal.meridian-optics.example", "45.0.113.22"],
+    )
+    case.add_signal(EvasionSignal(
+        typology=EvasionTypology.DUAL_USE_REEXPORT,
+        description="CNC controller units re-exported within 11 days of import.",
+        jurisdiction="AE",
+        confidence=0.85,
+        sources=["customs-mirror", "shipping-manifest"],
+        value_usd=4_200_000,
+    ))
+    case.add_signal(EvasionSignal(
+        typology=EvasionTypology.FRONT_PROCUREMENT_NETWORK,
+        description="Three buyers share one registered agent and one phone number.",
+        jurisdiction="TR",
+        confidence=0.75,
+        sources=["registry-scrape", "customs-mirror"],
+    ))
+    case.add_signal(EvasionSignal(
+        typology=EvasionTypology.CORRESPONDENT_BANK_NESTING,
+        description="Payments cleared through a nested respondent not named on file.",
+        jurisdiction="AE",
+        confidence=0.65,
+        sources=["swift-pattern"],
+        value_usd=3_100_000,
+    ))
+    case.add_signal(EvasionSignal(
+        typology=EvasionTypology.TRADE_MISINVOICING,
+        description="Declared unit price 38% under the regional trade median.",
+        jurisdiction="TR",
+        confidence=0.60,
+        sources=["price-reference"],
+        value_usd=900_000,
+    ))
+    tracker.track(case)
+
+    minor = EvasionCase(
+        case_id="SE-2025-0207",
+        subject="Unattributed bullion courier route",
+        target_regime="EMBARGOED-A",
+        infrastructure=["ledger.bullion-courier.example"],
+    )
+    minor.add_signal(EvasionSignal(
+        typology=EvasionTypology.GOLD_BULLION_FLIGHT,
+        description="Repeated hand-carry declarations just under reporting limits.",
+        jurisdiction="AM",
+        confidence=0.45,
+        sources=["border-declaration"],
+        value_usd=610_000,
+    ))
+    tracker.track(minor)
+
+    tracker.observe(MonetaryObservation(
+        site="Border bazaar, eastern corridor",
+        country="AE",
+        official_rate=1.00,
+        parallel_rate=1.42,
+        dollarization_ratio=0.62,
+        crypto_settlement_share=0.18,
+        remittance_dependency=0.28,
+        practices=[
+            "prices chalked in dollars, settled in local notes at a rate reset twice daily",
+            "brokers hold stablecoin balances so importers never touch an exchange",
+        ],
+    ))
+    tracker.observe(MonetaryObservation(
+        site="Frontline market town",
+        country="AM",
+        official_rate=1.00,
+        parallel_rate=2.35,
+        dollarization_ratio=0.41,
+        barter_share=0.34,
+        remittance_dependency=0.52,
+        scrip_in_circulation=True,
+        practices=[
+            "diesel and antibiotics function as the stable unit of account",
+            "coupon books issued by the municipal authority trade at a discount to notes",
+        ],
+    ))
+
+    tracker.request_sinkhole("SE-2025-0114", SinkholeRequest(
+        indicator="portal.meridian-optics.example",
+        hosting_jurisdiction="DE",
+        registrar_jurisdiction="US",
+        requesting_alliance=Alliance.NATO,
+        civilian_payment_share=0.02,
+    ))
+    tracker.request_sinkhole("SE-2025-0114", SinkholeRequest(
+        indicator="pay.meridian-optics.example",
+        hosting_jurisdiction="AE",
+        registrar_jurisdiction="AE",
+        requesting_alliance=Alliance.NATO,
+        civilian_payment_share=0.31,
+    ))
+    tracker.request_sinkhole("SE-2025-0114", SinkholeRequest(
+        indicator="45.0.113.22",
+        hosting_jurisdiction="RU",
+        registrar_jurisdiction="RU",
+        requesting_alliance=Alliance.NATO,
+    ))
+    tracker.request_sinkhole("SE-2025-0207", SinkholeRequest(
+        indicator="ledger.bullion-courier.example",
+        hosting_jurisdiction="NL",
+        registrar_jurisdiction="NL",
+        requesting_alliance=Alliance.NATO,
+    ))
+
+    return tracker
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="SYNTAX sanctions evasion tracker and wartime monetary ethnography",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit the report as JSON instead of text"
+    )
+    args = parser.parse_args()
+
+    tracker = build_demo_tracker()
+    report = tracker.build_report()
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        tracker.print_report(report)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,13 +1,18 @@
+import importlib.machinery
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
 
 def load_system_module():
     module_path = Path(__file__).resolve().parents[1] / "SYSTEM"
-    spec = importlib.util.spec_from_file_location("syntax_system", module_path)
+    loader = importlib.machinery.SourceFileLoader("syntax_system", str(module_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Registered before execution so dataclasses can resolve the module.
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
     return module
 
 
