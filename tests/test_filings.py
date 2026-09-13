@@ -261,6 +261,35 @@ class ThresholdSplitTests(unittest.TestCase):
         group = [make_filing(filing_id="A", amount_usd=25_000.0)]
         self.assertEqual(self.split_findings(group), [])
 
+    def test_group_with_only_one_sub_threshold_filing_is_not_a_split(self):
+        group = [
+            make_filing(filing_id="A", amount_usd=25_000.0, transaction_date="2025-03-01"),
+            make_filing(filing_id="B", amount_usd=9_000.0, transaction_date="2025-03-04"),
+        ]
+        self.assertEqual(self.split_findings(group), [])
+
+
+class ThresholdlessInstrumentTests(unittest.TestCase):
+    def test_instrument_without_a_threshold_rule_raises_no_amount_findings(self):
+        # Defensive branch: every shipped FilingType has a rule, so drop one to
+        # confirm an instrument with no monetary threshold is simply skipped.
+        original = dict(filings.REPORTING_THRESHOLDS)
+        filings.REPORTING_THRESHOLDS.pop(filings.FilingType.FORM_926)
+        try:
+            filing = make_filing(
+                filing_id="F926-1",
+                filing_type=filings.FilingType.FORM_926,
+                amount_usd=95_000.0,
+                cyphers={"transfer_category": "CASH"},
+            )
+            found = codes_from(filings.FilingDiagnostician().diagnose([filing]))
+            self.assertNotIn(filings.FindingCode.STRUCTURING_PROXIMITY, found)
+            self.assertNotIn(filings.FindingCode.SUBTHRESHOLD_FILING, found)
+            self.assertNotIn(filings.FindingCode.LATE_FILING, found)
+        finally:
+            filings.REPORTING_THRESHOLDS.clear()
+            filings.REPORTING_THRESHOLDS.update(original)
+
 
 class EvasionBridgeTests(unittest.TestCase):
     def test_findings_map_onto_declared_sanctions_typologies(self):
@@ -286,6 +315,21 @@ class EvasionBridgeTests(unittest.TestCase):
         ))
         typologies = {signal["typology"] for signal in diagnosis.evasion_signals()}
         self.assertIn("GOLD_BULLION_FLIGHT", typologies)
+
+    def test_unmapped_sar_instrument_emits_no_instrument_signal(self):
+        diagnosis = filings.FilingDiagnosis()
+        diagnosis.add(make_filing(
+            filing_id="SAR-10",
+            filing_type=filings.FilingType.SAR_111,
+            amount_usd=90_000.0,
+            cyphers={"activity_category": "ML", "instrument_involved": "NEG"},
+        ))
+        sources = [
+            source
+            for signal in diagnosis.evasion_signals()
+            for source in signal["sources"]
+        ]
+        self.assertNotIn("irs-filing:SAR-10", sources)
 
     def test_signals_carry_filing_provenance(self):
         diagnosis = filings.build_demo_diagnosis()

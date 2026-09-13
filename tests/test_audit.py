@@ -80,6 +80,10 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit.Contract("C-1", "S", "1", -5.0, "2025-01-01")
 
+    def test_negative_allocation_is_rejected(self):
+        with self.assertRaises(ValueError):
+            audit.ExpenditureCategory("1", "Works", -1.0)
+
 
 class DebarmentRegistryTests(unittest.TestCase):
     def setUp(self):
@@ -121,6 +125,17 @@ class DebarmentRegistryTests(unittest.TestCase):
             )
         ])
         self.assertIsNotNone(registry.match("Permanent Exclusion", date(2099, 1, 1)))
+
+    def test_entries_can_be_added_after_construction(self):
+        registry = audit.DebarmentRegistry()
+        self.assertIsNone(registry.match("Late Addition Ltd", date(2025, 1, 1)))
+        returned = registry.add(audit.DebarmentEntry(
+            name="Late Addition Ltd",
+            basis=audit.DebarmentBasis.CORRUPT_PRACTICE,
+            from_date="2024-01-01",
+        ))
+        self.assertIs(returned, registry)
+        self.assertIsNotNone(registry.match("Late Addition Ltd", date(2025, 1, 1)))
 
     def test_unrelated_supplier_does_not_match(self):
         self.assertIsNone(self.registry.match("Kestrel Infrastructure", date(2025, 2, 3)))

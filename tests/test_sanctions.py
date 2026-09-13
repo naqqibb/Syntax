@@ -147,6 +147,21 @@ class MonetaryEthnographyTests(unittest.TestCase):
                 site="s", country="XX", official_rate=0.0, parallel_rate=1.0,
             )
 
+    def test_every_ratio_field_is_bounds_checked(self):
+        for name in (
+            "dollarization_ratio",
+            "barter_share",
+            "crypto_settlement_share",
+            "remittance_dependency",
+        ):
+            for bad in (-0.1, 1.1):
+                with self.subTest(field=name, value=bad):
+                    with self.assertRaises(ValueError):
+                        sanctions.MonetaryObservation(
+                            site="s", country="XX", official_rate=1.0,
+                            parallel_rate=1.0, **{name: bad},
+                        )
+
 
 class AllianceRegistryTests(unittest.TestCase):
     def test_member_state_resolves_to_member(self):
